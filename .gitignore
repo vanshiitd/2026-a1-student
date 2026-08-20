@@ -10,3 +10,4 @@ data/full/
 *.log
 .venv/
 venv/
+.index_cache/
