@@ -23,30 +23,38 @@ where:
     avgdl    = average document length across the corpus
 
 k1 (typically 1.2-2.0) controls term-frequency saturation; b (in [0, 1])
-controls document-length normalisation strength. Both must be exposed as
-parameters, not hard-coded — you need to sweep them for your report
-(assignment Section 8, "parameter search procedure for k1, b").
-"""
-from typing import List, Tuple
+controls document-length normalisation strength. Both are exposed as real
+parameters -- never captured constants -- because the assignment requires
+sweeping them (Section 8, "parameter search procedure for k1, b") and the oral
+defense perturbs exactly these.
 
+The arithmetic itself lives in submission/_scorers.py (`bm25_contribution`) so
+that one postings traversal can feed several rankers; this module is the
+assignment-facing entrypoint for it.
+"""
+from typing import List, Optional, Tuple
+
+from submission import _traverse
 from submission.indexer import InvertedIndex
+
+_INDEX: Optional[InvertedIndex] = None
 
 
 def build(index: InvertedIndex) -> None:
-    """Optional: precompute anything BM25-specific (e.g. cached IDF values
-    per term) from the InvertedIndex built in indexer.py.
+    """Bind the index BM25 will score against.
 
-    Call this from retrieve.load_index(), not retrieve.build_index() —
-    the harness runs those two in separate processes, so any cache this
-    creates only needs to exist in the process that also calls
-    retrieve(). If you want a precomputed cache to persist across the
-    build/load boundary too, write it out via InvertedIndex.save() instead
-    (it then counts toward your index-size score) and rebuild the cache
-    here from the loaded index."""
-    raise NotImplementedError
+    Called from retrieve.load_index(), not retrieve.build_index() -- the harness
+    runs those in separate processes. Nothing is precomputed here: BM25 needs
+    only df, tf, document lengths and avgdl, all of which the index already
+    holds after `InvertedIndex.load()`.
+    """
+    global _INDEX
+    _INDEX = index
 
 
 def score(query: str, k: int, k1: float = 1.2, b: float = 0.75) -> List[Tuple[str, float]]:
     """Return up to k (doc_id, score) pairs for `query`, BM25-ranked,
     highest score first."""
-    raise NotImplementedError
+    if _INDEX is None:
+        raise RuntimeError("bm25.build(index) must be called before bm25.score()")
+    return _traverse.score_single(_INDEX, query, "bm25", k, k1=k1, b=b)
