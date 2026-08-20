@@ -1,6 +1,13 @@
 # Core (needed to run the harness and the shipped trivial baseline)
 pytest>=7.0
 
+# Required by submission/ — the index, codecs and scorers are all vectorised.
+# Explicitly permitted by the assignment (Section 1.2, "numerical libraries
+# (NumPy)"). Listed explicitly rather than relied on as a transitive dependency
+# of ir_datasets: ir_datasets is only needed for corpus download, which the
+# grading image has no reason to install.
+numpy>=1.24
+
 # Available if you want to compile part of your submission as a C/C++
 # extension (e.g. via Cython) for the efficiency / index-size leaderboard
 # components — see docs/SUBMISSION_INTERFACE.md, "Compiled extensions".
