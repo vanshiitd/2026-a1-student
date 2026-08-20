@@ -11,6 +11,10 @@ echo "== Metrics unit tests =="
 pytest tests/test_metrics.py -v
 
 echo
+echo "== Component correctness tests (codecs, BM25, Boolean/VSM) =="
+pytest tests/test_codecs.py tests/test_ranking_components.py -v
+
+echo
 echo "== Full harness run on the toy set =="
 python -m harness.run_harness \
   --corpus data/toy/corpus.jsonl \
