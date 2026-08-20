@@ -11,3 +11,4 @@ data/full/
 .venv/
 venv/
 .index_cache/
+.index_cache-*/

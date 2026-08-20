@@ -8,6 +8,13 @@ pytest>=7.0
 # grading image has no reason to install.
 numpy>=1.24
 
+# Porter stemmer for the analysis chain. Explicitly permitted by the assignment
+# (Section 1.2, "standard libraries for tokenisation/stemming (e.g., NLTK's
+# Porter stemmer)"). NLTK's PorterStemmer is purely algorithmic and needs no
+# downloaded nltk_data corpora, which matters because the grading container runs
+# with networking disabled.
+nltk>=3.8
+
 # Available if you want to compile part of your submission as a C/C++
 # extension (e.g. via Cython) for the efficiency / index-size leaderboard
 # components — see docs/SUBMISSION_INTERFACE.md, "Compiled extensions".

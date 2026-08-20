@@ -44,22 +44,50 @@ DEFAULT_INDEX = os.path.join(REPO, ".index_cache")
 # Index / data loading
 # ---------------------------------------------------------------------------
 
-def get_index(corpus_path: str, index_dir: str = DEFAULT_INDEX, rebuild: bool = False):
-    """Build the index once and reuse it across sweeps.
+def config_slug(config) -> str:
+    """Short stable name for an analysis config, used for index cache dirs."""
+    if config is None:
+        return "default"
+    d = config.to_dict()
+    parts = []
+    if d.get("stemmer"):
+        parts.append(str(d["stemmer"]))
+    if d.get("remove_stopwords"):
+        parts.append("nostop")
+    if d.get("split_alphanum"):
+        parts.append("splitan")
+    if d.get("min_token_len", 1) != 1:
+        parts.append(f"minlen{d['min_token_len']}")
+    return "-".join(parts) if parts else "plain"
 
-    Sweeps only vary *scoring* parameters, which never change the index, so
-    rebuilding per configuration would waste ~10s each time. Pass rebuild=True
-    after changing anything in the analysis chain, which does change it.
+
+def get_index(corpus_path: str, index_dir: str = DEFAULT_INDEX, rebuild: bool = False,
+              config=None):
+    """Build the index once per analysis config and reuse it across sweeps.
+
+    Scoring sweeps vary only *scoring* parameters, which never change the index,
+    so rebuilding per configuration would waste ~11s each time. The analysis
+    chain does change it, so each config gets its own cache directory keyed by
+    `config_slug()` -- otherwise a stemmed sweep would silently read an
+    unstemmed index and every conclusion drawn from it would be wrong.
     """
+    if config is not None:
+        index_dir = f"{index_dir}-{config_slug(config)}"
     meta = os.path.join(index_dir, "meta.json")
     if rebuild or not os.path.exists(meta):
-        print(f"building index -> {index_dir} ...", flush=True)
+        print(f"building index -> {os.path.basename(index_dir)} ...", flush=True)
         os.makedirs(index_dir, exist_ok=True)
-        index = InvertedIndex()
+        index = InvertedIndex(config)
         index.build_from_jsonl(corpus_path)
         index.save(index_dir)
         return index
-    return InvertedIndex.load(index_dir)
+    loaded = InvertedIndex.load(index_dir)
+    if config is not None and loaded.config != config:
+        raise RuntimeError(
+            f"cached index at {index_dir} was built with {loaded.config}, "
+            f"not {config}; delete it and rebuild"
+        )
+    return loaded
 
 
 def load_topics(data_dir: str = DEFAULT_DATA):

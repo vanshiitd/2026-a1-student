@@ -1,0 +1,54 @@
+{
+  "best_single": {
+    "chain": "porter+nostop+splitan",
+    "honest": 0.6296086436539542,
+    "params": {
+      "k1": 4.2,
+      "b": 0.45
+    },
+    "index_mb": 32.511544
+  },
+  "fusions": [
+    {
+      "chains": [
+        "porter+nostop+splitan",
+        "splitan",
+        "porter"
+      ],
+      "ndcg": 0.6384182505800584,
+      "index_mb": 110.53006099999999,
+      "delta": 0.00880960692610408,
+      "p": 0.5567
+    },
+    {
+      "chains": [
+        "porter+nostop+splitan",
+        "porter"
+      ],
+      "ndcg": 0.6366027119847337,
+      "index_mb": 69.929181,
+      "delta": 0.006994068330779483,
+      "p": 0.4332
+    },
+    {
+      "chains": [
+        "porter+nostop+splitan",
+        "splitan"
+      ],
+      "ndcg": 0.6354008436688954,
+      "index_mb": 73.112424,
+      "delta": 0.005792200014941122,
+      "p": 0.7323
+    },
+    {
+      "chains": [
+        "splitan",
+        "porter"
+      ],
+      "ndcg": 0.6320162684172465,
+      "index_mb": 78.018517,
+      "delta": 0.002407624763292227,
+      "p": 0.9045
+    }
+  ]
+}
