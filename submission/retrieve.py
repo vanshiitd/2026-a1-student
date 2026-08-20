@@ -34,13 +34,30 @@ from submission.indexer import InvertedIndex
 # ---------------------------------------------------------------------------
 # Ranking configuration.
 #
-# Textbook defaults, NOT yet tuned — the k1/b sweep and cross-validated
-# selection (assignment Section 8) is scheduled work, and these constants are
-# what it will replace. Kept here, named, and in one place so the oral-defense
-# perturbation exercise ("change k1 and predict the effect") is a one-line edit.
+# Tuned on the dev set only, never on held-out topics (assignment Section 8).
+# Selected by argmax of the neighbourhood-smoothed (k1, b) surface over an
+# 840-point grid — see experiments/sweep_bm25.py and experiments/cv_select.py.
+#
+# Both the smoothed rule and a plain argmax pick this same point on the full dev
+# set, and 5-fold nested cross-validation puts its honest held-out value at
+# 0.6253 nDCG@10 versus 0.5596 for the textbook defaults (+0.066, p = 0.0002,
+# paired bootstrap).
+#
+# k1 = 4.5 is far above the textbook 1.2–2.0. That is not a typo: with ~170-token
+# abstracts, a repeated query term is real evidence rather than boilerplate, so
+# weaker tf saturation helps. The k1 surface is also very flat — everything from
+# roughly 1.5 to 8.1 sits within noise of the peak — so the precise value matters
+# much less than the direction.
+#
+# b = 0.60 is below the textbook 0.75 because this collection's document lengths
+# are bimodal (title-only stubs at p25 = 31 tokens vs full abstracts at p50 =
+# 176); aggressive length normalisation over-promotes the stubs.
+#
+# Kept here, named, and in one place so the oral-defense perturbation exercise
+# ("change k1 and predict the effect") is a one-line edit.
 # ---------------------------------------------------------------------------
-BM25_K1 = 1.2
-BM25_B = 0.75
+BM25_K1 = 4.5
+BM25_B = 0.60
 
 # ---------------------------------------------------------------------------
 # Module-level state. load_index() populates this; retrieve() reads it.
