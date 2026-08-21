@@ -1,0 +1,22 @@
+{
+  "A": {
+    "params": {
+      "k1": 5.7,
+      "b": 0.6,
+      "title_lambda": 0.1
+    },
+    "test_half": "B",
+    "split_selected": 0.6701752073933891,
+    "shipped": 0.6701752073933891
+  },
+  "B": {
+    "params": {
+      "k1": 4.5,
+      "b": 0.6,
+      "title_lambda": 0.12
+    },
+    "test_half": "A",
+    "split_selected": 0.6085605412915828,
+    "shipped": 0.6087650207250577
+  }
+}
