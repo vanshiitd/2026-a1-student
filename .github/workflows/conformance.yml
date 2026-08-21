@@ -54,3 +54,20 @@ jobs:
         with:
           name: dev-run-and-report
           path: runs/
+
+  # The assignment requires `docker build` / `docker run` to succeed cleanly by
+  # the conformance freeze. Verified here because Docker is not installed on the
+  # development machine, so CI is the only place this can be checked at all.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the submission image
+        run: docker build -t a1-submission .
+
+      - name: Run the image's default command (harness on the toy set)
+        run: docker run --rm a1-submission
+
+      - name: Run the full test suite inside the image
+        run: docker run --rm a1-submission pytest tests/ -q

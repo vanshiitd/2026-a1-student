@@ -329,3 +329,71 @@ def test_scorers_raise_a_clear_error_before_build(index):
     finally:
         bm25.build(index)
         boolean_vsm.build(index)
+
+
+# ---------------------------------------------------------------------------
+# Robustness at the graded boundary
+# ---------------------------------------------------------------------------
+# The harness aborts the entire run on any exception out of retrieve(), so a
+# single malformed held-out query would zero all topics. These tests pin down
+# that adversarial input degrades one query rather than the whole submission,
+# and -- just as important -- that the degradation is never silently wrong.
+
+ADVERSARIAL = [
+    "",                                   # empty
+    "   \t\n  ",                          # whitespace only
+    "!!! ??? ---",                        # punctuation only
+    "你好 مرحبا αβγ",  # non-Latin scripts
+    "\x00\x01 null bytes",                # control characters
+    "a" * 50_000,                         # pathologically long single token
+    " ".join(["covid"] * 5_000),          # pathologically long query
+    "zzzqqq wwwvvv",                      # entirely out of vocabulary
+    "COVID-19 SARS-CoV-2 100%",           # punctuation mixed into real terms
+]
+
+
+@pytest.mark.parametrize("query", ADVERSARIAL)
+def test_retrieve_survives_adversarial_queries(index, query):
+    from submission import retrieve as entry
+    entry._INDEX = index
+    bm25.build(index)
+    results = entry.retrieve(query, 10)
+    assert isinstance(results, list)
+    assert len(results) <= 10
+    docs = [d for d, _ in results]
+    assert len(docs) == len(set(docs)), "duplicate doc_id would be a RUNTIME_ERROR"
+    scores = [s for _d, s in results]
+    assert scores == sorted(scores, reverse=True)
+    for doc_id, score in results:
+        assert doc_id in {"d1", "d2", "d3"}
+        assert isinstance(score, (int, float))
+
+
+def test_retrieve_still_raises_before_load_index():
+    """The guard must not swallow genuine misuse: retrieve() before
+    load_index() is a harness-contract violation and should fail loudly."""
+    from submission import retrieve as entry
+    saved = entry._INDEX
+    entry._INDEX = None
+    try:
+        with pytest.raises(RuntimeError, match="load_index"):
+            entry.retrieve("a", 10)
+    finally:
+        entry._INDEX = saved
+
+
+def test_retrieve_guard_degrades_one_query_not_the_run(index, monkeypatch, capsys):
+    """A scorer blowing up must cost one query, not the whole submission."""
+    from submission import retrieve as entry
+    entry._INDEX = index
+
+    def boom(*_a, **_kw):
+        raise ValueError("simulated scorer failure")
+
+    monkeypatch.setattr(entry.bm25, "score", boom)
+    assert entry.retrieve("a b c", 10) == []
+    assert "simulated scorer failure" in capsys.readouterr().err
+
+    monkeypatch.undo()
+    bm25.build(index)
+    assert entry.retrieve("a b c", 10), "must recover once the fault clears"
