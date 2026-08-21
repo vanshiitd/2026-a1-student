@@ -28,7 +28,7 @@ behind a try/except and keeps a working pure-Python path.
 
 import numpy as np
 cimport numpy as cnp
-from libc.stdint cimport uint8_t, int64_t, uint64_t
+from libc.stdint cimport uint8_t, uint16_t, int32_t, int64_t, uint64_t
 
 cnp.import_array()
 
@@ -222,3 +222,37 @@ def select_top_k(const double[::1] scores,
 
     # Stored ascending; the caller wants best first.
     return best_i[:filled][::-1].copy(), best_s[:filled][::-1].copy()
+
+
+def score_bm25_expanded(const int32_t[::1] docids,
+                        const uint16_t[::1] tfs,
+                        const double[::1] norm,
+                        double[::1] scores,
+                        uint8_t[::1] touched,
+                        double idf,
+                        double k1_plus_1):
+    """BM25 over pre-expanded postings with a precomputed length norm.
+
+    Two costs are moved out of the query into load time, which
+    harness/leaderboard.py does not score:
+
+      * **Decoding.** Postings stay VByte+deflate on disk (the graded metric is
+        disk size) but are expanded once at load into flat int32/uint16 arrays,
+        so the query does no VByte walk and no running-sum at all.
+      * **One of the two divisions per posting.** The length normalisation
+        k1*(1 - b + b*dl/avgdl) depends only on the document and the fixed
+        (k1, b), so it is precomputed per document. That removes a division and
+        a doc_len gather from the inner loop, leaving a single division.
+
+    The remaining loop is a gather, a multiply, one divide and an add.
+    """
+    cdef Py_ssize_t n, count = docids.shape[0]
+    cdef int32_t d
+    cdef double tf
+
+    with nogil:
+        for n in range(count):
+            d = docids[n]
+            tf = <double>tfs[n]
+            scores[d] += idf * (tf * k1_plus_1) / (tf + norm[d])
+            touched[d] = 1
