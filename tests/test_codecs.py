@@ -99,3 +99,27 @@ def test_gap_encoding_actually_shrinks_dense_postings():
     encoded = encode_sorted_ids(ids)
     assert encoded.size < ids.size * 1.1, "dense gaps should cost ~1 byte each"
     assert encoded.size < ids.nbytes / 3, "should be far smaller than raw int64"
+
+
+def test_index_files_are_compressed_on_disk():
+    """The on-disk byte size is the graded metric, so persisted files must stay
+    compressed. This guards against a refactor quietly reverting to raw writes.
+    """
+    import os, tempfile, zlib
+    from submission.indexer import InvertedIndex
+
+    corpus = [(f"d{i}", " ".join(f"term{j}" for j in range(i % 50 + 1))) for i in range(300)]
+    ix = InvertedIndex(); ix.build(corpus)
+    with tempfile.TemporaryDirectory() as d:
+        ix.save(d)
+        for name in os.listdir(d):
+            if name == "meta.json":       # left plain: needed to read the version
+                continue
+            blob = open(os.path.join(d, name), "rb").read()
+            if not blob:
+                continue
+            zlib.decompress(blob)          # raises if not a zlib stream
+        reloaded = InvertedIndex.load(d)
+    assert reloaded.terms == ix.terms
+    np.testing.assert_array_equal(reloaded.df, ix.df)
+    np.testing.assert_array_equal(reloaded._tf_packed, ix._tf_packed)
