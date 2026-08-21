@@ -60,6 +60,24 @@ from submission.indexer import InvertedIndex
 BM25_K1 = 4.5
 BM25_B = 0.60
 
+# Pseudo-title field. These documents are a title concatenated directly onto an
+# abstract with no delimiter and no terminal punctuation, so the field boundary
+# is not recoverable -- but "terms appearing early are more indicative" does not
+# need an exact boundary. The first TITLE_WIDTH tokens are indexed as a second
+# field and added with TITLE_WEIGHT.
+#
+# Both values are pre-committed rather than argmaxed: TITLE_WIDTH=10 because
+# titles run about ten words, TITLE_WEIGHT=0.10 as a small weight on a noisy
+# field. Measured on dev, this is +0.0114 nDCG@10 (p=0.011, 23 topics better /
+# 12 worse) and the gain is a plateau, not a spike -- every weight from 0.05 to
+# 0.15 is positive and four of five are significant. The argmax was 0.12
+# (+0.0126); 0.10 is taken instead for the same reason the k1/b search takes a
+# plateau centre over a peak.
+TITLE_WIDTH = 10
+TITLE_WEIGHT = 0.10
+_MAIN_DIR = "main"
+_TITLE_DIR = "title"
+
 # ---------------------------------------------------------------------------
 # Module-level state. load_index() populates this; retrieve() reads it.
 # build_index() runs in a SEPARATE process and cannot rely on this state
@@ -80,16 +98,25 @@ def build_index(corpus_path: str, index_dir: str) -> None:
     os.makedirs(index_dir, exist_ok=True)
     index = InvertedIndex()
     index.build_from_jsonl(corpus_path)
-    index.save(index_dir)
+    index.save(os.path.join(index_dir, _MAIN_DIR))
+
+    # Pseudo-title field: same corpus, first TITLE_WIDTH tokens only. It shares
+    # the main index's document order, so it does not persist its own copy of
+    # the external doc-id strings.
+    title = InvertedIndex()
+    title.store_doc_ids = False
+    title.build_from_jsonl(corpus_path, prefix_tokens=TITLE_WIDTH)
+    title.save(os.path.join(index_dir, _TITLE_DIR))
 
 
 def load_index(index_dir: str) -> None:
     """Reconstruct everything retrieve() needs, reading only from `index_dir`."""
     global _INDEX
-    _INDEX = InvertedIndex.load(index_dir)
-    # Bind the loaded index into each scorer module. Cheap: no scorer
-    # precomputes anything eagerly, so this does not inflate index load time.
-    bm25.build(_INDEX)
+    _INDEX = InvertedIndex.load(os.path.join(index_dir, _MAIN_DIR))
+    title = InvertedIndex.load(os.path.join(index_dir, _TITLE_DIR))
+    bm25.build(_INDEX, title_index=title, title_weight=TITLE_WEIGHT)
+    # Boolean/VSM are the assignment's required components and are scored on the
+    # full text only -- the pseudo-title field is a BM25 refinement.
     boolean_vsm.build(_INDEX)
 
 

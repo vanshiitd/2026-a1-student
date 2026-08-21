@@ -121,6 +121,10 @@ class InvertedIndex:
         # needed by proximity/phrase scoring, so they are opt-in: an index built
         # without them is byte-for-byte what it was before this existed.
         self.store_positions = store_positions
+        self._prefix_tokens = -1
+        # The pseudo-title index shares the main index's document order, so it
+        # does not need its own copy of the external doc-id strings (1.5MB).
+        self.store_doc_ids = True
         self._pos_buf = np.zeros(0, dtype=np.uint8)
         self._pos_off = np.zeros(1, dtype=np.int64)
         self.terms: List[str] = []
@@ -154,8 +158,13 @@ class InvertedIndex:
         """
         self._build(iter(corpus))
 
-    def build_from_jsonl(self, corpus_path: str) -> None:
-        """Build by streaming a corpus.jsonl file -- the memory-safe path."""
+    def build_from_jsonl(self, corpus_path: str, prefix_tokens: int = -1) -> None:
+        """Build by streaming a corpus.jsonl file -- the memory-safe path.
+
+        `prefix_tokens >= 0` indexes only each document's first N tokens, which
+        is how the pseudo-title field is built (see submission/retrieve.py).
+        """
+        self._prefix_tokens = prefix_tokens
         self._build(_iter_jsonl(corpus_path))
 
     def _build(self, docs: Iterable[Tuple[str, str]]) -> None:
@@ -180,7 +189,8 @@ class InvertedIndex:
             doc_ids.append(ext_id)
             # str.lower() stays in Python: it is already C-speed and applies the
             # full Unicode case mapping the byte scanner cannot.
-            doc_lens.append(builder.add_document(text.lower().encode("utf-8"), internal_id))
+            doc_lens.append(builder.add_document(
+                text.lower().encode("utf-8"), internal_id, self._prefix_tokens))
 
         self.doc_ids = doc_ids
         self.doc_len = np.array(doc_lens, dtype=np.int64)
@@ -378,6 +388,8 @@ class InvertedIndex:
 
         for internal_id, (ext_id, text) in enumerate(docs):
             tokens = analyzer(text)
+            if self._prefix_tokens >= 0:
+                tokens = tokens[:self._prefix_tokens]
             doc_ids.append(ext_id)
             doc_lens.append(len(tokens))
             # Counter preserves first-seen order, so this loop is deterministic.
@@ -563,6 +575,7 @@ class InvertedIndex:
             "avg_doc_len": self.avg_doc_len,
             "analysis": self.config.to_dict(),
             "store_positions": self.store_positions,
+            "store_doc_ids": self.store_doc_ids,
             "n_tf_exceptions": int(self._tf_exc_idx.size),
         }
         with open(os.path.join(index_dir, _META), "w", encoding="utf-8") as f:
@@ -572,8 +585,9 @@ class InvertedIndex:
         # collection carry no newlines, so newline framing is unambiguous.
         self._write_blob(os.path.join(index_dir, _TERMS),
                          "\n".join(self.terms).encode("utf-8"))
-        self._write_blob(os.path.join(index_dir, _DOCIDS),
-                         "\n".join(self.doc_ids).encode("utf-8"))
+        if self.store_doc_ids:
+            self._write_blob(os.path.join(index_dir, _DOCIDS),
+                             "\n".join(self.doc_ids).encode("utf-8"))
 
         # Per-term byte lengths rather than absolute offsets: the lengths are
         # small integers that VByte to ~1 byte, while absolute offsets grow to
@@ -630,7 +644,8 @@ class InvertedIndex:
             return vbyte_decode(read_raw(name), count)
 
         index.terms = read_text(_TERMS)
-        index.doc_ids = read_text(_DOCIDS)
+        index.store_doc_ids = bool(meta.get("store_doc_ids", True))
+        index.doc_ids = read_text(_DOCIDS) if index.store_doc_ids else []
         index.term_lookup = {term: i for i, term in enumerate(index.terms)}
 
         index.df = read_vbyte(_DF, n_terms)

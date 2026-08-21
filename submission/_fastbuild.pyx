@@ -86,8 +86,12 @@ cdef class Builder:
                 and d.get("stemmer") is None
                 and not d.get("split_alphanum", False))
 
-    def add_document(self, bytes lowered_utf8, int doc_id):
-        """Tokenise one document and emit its postings. Returns the token count."""
+    def add_document(self, bytes lowered_utf8, int doc_id, Py_ssize_t prefix_tokens=-1):
+        """Tokenise one document and emit its postings. Returns the token count.
+
+        `prefix_tokens >= 0` stops after that many surviving tokens, which is how
+        the pseudo-title field is built without a second pass over the text.
+        """
         cdef const unsigned char* buf = <const unsigned char*>lowered_utf8
         cdef Py_ssize_t n = len(lowered_utf8)
         cdef Py_ssize_t i = 0, start
@@ -132,6 +136,9 @@ cdef class Builder:
             if self.scratch_tf[tid] == 0:
                 self.touched.push_back(tid)
             self.scratch_tf[tid] += 1
+
+            if prefix_tokens >= 0 and n_tokens >= prefix_tokens:
+                break
 
         # Flush this document's postings, resetting only what was touched.
         for j in range(<Py_ssize_t>self.touched.size()):

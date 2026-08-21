@@ -58,6 +58,8 @@ except ImportError:  # pragma: no cover - exercised by the fallback test
     HAVE_FAST = False
 
 _INDEX: Optional[InvertedIndex] = None
+_TITLE: Optional[InvertedIndex] = None
+_TITLE_WEIGHT: float = 0.0
 
 # The parameters retrieve() actually ships with; their length-norm array is
 # precomputed at load so the first query is not slower than the rest.
@@ -67,20 +69,23 @@ BM25_DEFAULT_B = 0.60
 # Query-time caches, built on first use. Load time is not a scored metric
 # (harness/leaderboard.py's efficiency_modifier takes only build time and query
 # latency), so paying it here to make queries cheaper is free.
-_EXPANDED = None          # (docids int32, tfs uint16) for the whole collection
+_EXPANDED = {}            # id(index) -> (docids int32, tfs uint16)
 _NORM_CACHE = {}          # (k1, b) -> precomputed per-document length norm
 
 
-def build(index: InvertedIndex) -> None:
+def build(index: InvertedIndex, title_index: Optional[InvertedIndex] = None,
+          title_weight: float = 0.0) -> None:
     """Bind the index BM25 will score against.
 
     Called from retrieve.load_index(), not retrieve.build_index() -- the harness
     runs those in separate processes. Query-time caches are warmed here rather
     than lazily, because load time is unscored while per-query latency is not.
     """
-    global _INDEX, _EXPANDED, _NORM_CACHE
+    global _INDEX, _EXPANDED, _NORM_CACHE, _TITLE, _TITLE_WEIGHT
     _INDEX = index
-    _EXPANDED = None
+    _TITLE = title_index
+    _TITLE_WEIGHT = title_weight
+    _EXPANDED = {}
     _NORM_CACHE = {}
     if HAVE_FAST and index.N:
         # Warm both caches HERE, not lazily on the first query. build() is
@@ -89,6 +94,9 @@ def build(index: InvertedIndex) -> None:
         # to query one and took mean latency from 0.76ms to 8.70ms.
         _expanded(index)
         _length_norm(index, BM25_DEFAULT_K1, BM25_DEFAULT_B)
+        if title_index is not None and title_index.N:
+            _expanded(title_index)
+            _length_norm(title_index, BM25_DEFAULT_K1, BM25_DEFAULT_B)
 
 
 def score(query: str, k: int, k1: float = 1.2, b: float = 0.75) -> List[Tuple[str, float]]:
@@ -108,8 +116,8 @@ def _expanded(index):
     sum from every query thereafter. The on-disk index is untouched -- it stays
     VByte+deflate, which is what the index-size metric measures.
     """
-    global _EXPANDED
-    if _EXPANDED is None:
+    cached = _EXPANDED.get(id(index))
+    if cached is None:
         total = int(index.df.sum())
         gaps = vbyte_decode(index._docid_buf, total)
         starts = index._term_start
@@ -120,19 +128,49 @@ def _expanded(index):
         docids = (running - np.repeat(base, index.df)).astype(np.int32)
         tfs = unpack_tf_nibbles(index._tf_packed, 0, total,
                                 index._tf_exc_idx, index._tf_exc_val).astype(np.uint16)
-        _EXPANDED = (docids, tfs)
-    return _EXPANDED
+        cached = (docids, tfs)
+        _EXPANDED[id(index)] = cached
+    return cached
 
 
 def _length_norm(index, k1: float, b: float):
     """k1 * (1 - b + b*dl/avgdl) per document, cached per (k1, b)."""
-    key = (k1, b)
+    key = (id(index), k1, b)
     cached = _NORM_CACHE.get(key)
     if cached is None:
         avgdl = index.avg_doc_len or 1.0
         cached = k1 * (1.0 - b + b * (index.doc_len.astype(np.float64) / avgdl))
         _NORM_CACHE[key] = cached
     return cached
+
+
+def _accumulate(index, terms, scores, touched, k1: float, b: float,
+                weight: float) -> bool:
+    """Add one field's BM25 contribution into `scores`, scaled by `weight`.
+
+    The weight multiplies the whole per-term contribution, and IDF is a factor
+    of it, so folding the weight into IDF is exact and keeps the kernel
+    signature unchanged.
+    """
+    docids_all, tfs_all = _expanded(index)
+    norm = _length_norm(index, k1, b)
+    hit = False
+    for term in terms:
+        tid = index.term_id(term)
+        if tid < 0:
+            continue
+        count = int(index.df[tid])
+        if count == 0:
+            continue
+        hit = True
+        start = int(index._term_start[tid])
+        _fast.score_bm25_expanded(
+            docids_all[start:start + count],
+            tfs_all[start:start + count],
+            norm, scores, touched,
+            weight * robertson_idf(count, index.N), k1 + 1.0,
+        )
+    return hit
 
 
 def _score_fast(index, query: str, k: int, k1: float, b: float) -> List[Tuple[str, float]]:
@@ -154,27 +192,17 @@ def _score_fast(index, query: str, k: int, k1: float, b: float) -> List[Tuple[st
     if not terms:
         return []
 
-    docids_all, tfs_all = _expanded(index)
-    norm = _length_norm(index, k1, b)
     scores = np.zeros(index.N, dtype=np.float64)
     touched = np.zeros(index.N, dtype=np.uint8)
-    hit = False
+    hit = _accumulate(index, terms, scores, touched, k1, b, 1.0)
+    # Pseudo-title field: the first N tokens of each document, scored as a
+    # separate BM25 field and added with a small weight. Documents here are a
+    # title concatenated onto an abstract with no delimiter, so the boundary
+    # cannot be recovered exactly -- but the signal (terms appearing early are
+    # more indicative) does not need an exact boundary.
+    if _TITLE is not None and _TITLE_WEIGHT and _TITLE.N == index.N:
+        hit = _accumulate(_TITLE, terms, scores, touched, k1, b, _TITLE_WEIGHT) or hit
 
-    for term in terms:
-        tid = index.term_id(term)
-        if tid < 0:
-            continue
-        count = int(index.df[tid])
-        if count == 0:
-            continue
-        hit = True
-        start = int(index._term_start[tid])
-        _fast.score_bm25_expanded(
-            docids_all[start:start + count],
-            tfs_all[start:start + count],
-            norm, scores, touched,
-            robertson_idf(count, index.N), k1 + 1.0,
-        )
     if not hit:
         return []
 
