@@ -55,6 +55,13 @@ GRIDS: Dict[str, Dict[str, np.ndarray]] = {
     "lmd": {
         "mu": np.round(np.geomspace(50, 20000, 40), 1),
     },
+    # c enters PL2 inside a logarithm, so it is scanned geometrically.
+    "pl2": {
+        "c": np.round(np.geomspace(0.05, 40.0, 40), 4),
+    },
+    # DPH is parameter-free by construction -- a single configuration, and
+    # nothing about it can be overfitted to the dev set.
+    "dph": {},
 }
 
 

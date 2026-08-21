@@ -156,6 +156,110 @@ def _lm_dirichlet_prior(doc_lens, query_len, stats: CollectionStats, mu=1500.0):
     return query_len * np.log(mu / (doc_lens + mu))
 
 
+# ---------------------------------------------------------------------------
+# Divergence From Randomness (Amati & van Rijsbergen 2002)
+#
+# DFR scores a term by how far its distribution in a document diverges from
+# what a random process would produce. The family is worth having because it
+# reaches the same goal by an entirely different route from BM25's heuristic
+# saturation, which makes it a natural decorrelated partner rather than another
+# BM25 variant.
+#
+# Both models below follow Terrier's reference implementations (PL2.java,
+# DPH.java). PROVENANCE: transcribed from those formulations rather than derived
+# here, and listed as such in the report's code-provenance statement.
+# ---------------------------------------------------------------------------
+
+_LOG2_E = float(np.log2(np.e))
+_LOG2_2PI = float(np.log2(2.0 * np.pi))
+
+
+def _log2(x):
+    return np.log2(x)
+
+
+@register(
+    "pl2",
+    defaults={"c": 1.0},
+    description="DFR PL2: Poisson model, Laplace after-effect, Normalisation 2.",
+)
+def pl2_contribution(tfs, doc_lens, df, cf, query_tf, stats: CollectionStats, c=1.0):
+    """PL2 = Poisson randomness + Laplace after-effect + Normalisation 2.
+
+        tfn    = tf * log2(1 + c * avgdl / dl)          (Normalisation 2)
+        lambda = cf / N
+        score  = qtf * 1/(tfn+1) * [ tfn*log2(tfn/lambda)
+                                     + (lambda + 1/(12*tfn) - tfn)*log2(e)
+                                     + 0.5*log2(2*pi*tfn) ]
+
+    `c` plays the role BM25's `b` does -- it sets how hard document length is
+    normalised -- but enters multiplicatively inside a logarithm rather than as
+    a linear interpolation, which is why the two models disagree about long
+    documents in a genuinely different way.
+    """
+    tf = tfs.astype(np.float64)
+    avgdl = stats.avg_doc_len or 1.0
+    dl = np.maximum(doc_lens, 1.0)
+    tfn = tf * _log2(1.0 + c * avgdl / dl)
+
+    out = np.zeros(tf.shape, dtype=np.float64)
+    # tfn <= 0 carries no evidence and would make the logs undefined.
+    ok = tfn > 0.0
+    if not ok.any():
+        return out
+
+    t = tfn[ok]
+    lam = cf / stats.N if stats.N else 0.0
+    if lam <= 0.0:
+        lam = 1.0 / max(stats.N, 1)
+    out[ok] = query_tf * (1.0 / (t + 1.0)) * (
+        t * _log2(t / lam)
+        + (lam + 1.0 / (12.0 * t) - t) * _LOG2_E
+        + 0.5 * (_LOG2_2PI + _log2(t))
+    )
+    return out
+
+
+@register(
+    "dph",
+    defaults={},
+    description="DFR DPH: hypergeometric, parameter-free (no tuning knob at all).",
+)
+def dph_contribution(tfs, doc_lens, df, cf, query_tf, stats: CollectionStats):
+    """DPH -- parameter-free DFR.
+
+        f     = tf / dl
+        norm  = (1 - f)^2 / (tf + 1)
+        score = qtf * norm * [ tf*log2( (tf*avgdl/dl) * (N/cf) )
+                               + 0.5*log2(2*pi*tf*(1-f)) ]
+
+    Having no free parameter is the point: it cannot be overfitted to the dev
+    set, which on a 50-topic collection is a real advantage rather than a
+    limitation (see notes/findings.md F20 -- selection bias on this data is the
+    same order as the effects being chased).
+    """
+    tf = tfs.astype(np.float64)
+    avgdl = stats.avg_doc_len or 1.0
+    dl = np.maximum(doc_lens, 1.0)
+    f = tf / dl
+
+    out = np.zeros(tf.shape, dtype=np.float64)
+    # f >= 1 means the document is nothing but this term; (1-f) then makes the
+    # after-effect log undefined, and such a document carries no evidence anyway.
+    ok = (f < 1.0) & (tf > 0.0)
+    if not ok.any():
+        return out
+
+    t, ff, d = tf[ok], f[ok], dl[ok]
+    norm = (1.0 - ff) ** 2 / (t + 1.0)
+    inv_p = (t * avgdl / d) * (stats.N / max(cf, 1))
+    inv_p = np.maximum(inv_p, 1.0 + 1e-12)   # keep log2 non-negative
+    out[ok] = query_tf * norm * (
+        t * _log2(inv_p) + 0.5 * (_LOG2_2PI + _log2(t * (1.0 - ff)))
+    )
+    return out
+
+
 @register(
     "lmd",
     defaults={"mu": 1500.0},
