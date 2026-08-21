@@ -44,7 +44,7 @@ REPO = os.path.join(os.path.dirname(__file__), "..")
 RESULTS = os.path.join(os.path.dirname(__file__), "results.jsonl")
 
 # Every technique measured, with its in-sample and honest cross-validated gain.
-# Sourced from notes/findings.md F9-F21; kept here so the ablation table and the
+# Sourced from notes/findings.md F9-F23; kept here so the ablation table and the
 # figure are generated from one list rather than two hand-copied ones.
 ABLATION = [
     ("k1/b grid search",            +0.0685, +0.0657, "0.0002", "SHIPPED"),
@@ -52,9 +52,13 @@ ABLATION = [
     ("Cross-chain RRF fusion",      +0.0218, +0.0070, "0.43",   "rejected"),
     ("RM3 feedback",                +0.0190, +0.0048, "0.79",   "rejected"),
     ("SDM / proximity",             +0.0022, +0.0022, "0.23",   "rejected"),
+    ("IDF exponent (p=1.25)",       -0.0178, -0.0178, "n/a",    "rejected"),
     ("z-norm score fusion",         -0.0020, -0.0020, "0.50",   "rejected"),
     ("IDF coverage weighting",      -0.0086, -0.0086, "0.36",   "rejected"),
     ("Scorer RRF fusion",           -0.0190, -0.0190, "0.16",   "rejected"),
+    ("Near-duplicate removal",      -0.0285, -0.0285, "n/a",    "rejected"),
+    ("Drop high-df query terms",    -0.0058, -0.0058, "n/a",    "rejected"),
+    ("Require rarest query term",   -0.0840, -0.0840, "n/a",    "rejected"),
 ]
 
 
