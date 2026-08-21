@@ -24,6 +24,14 @@ import numpy as np
 
 extensions = [
     Extension(
+        "submission._fastbuild",
+        sources=["submission/_fastbuild.pyx"],
+        include_dirs=[np.get_include()],
+        language="c++",
+        extra_compile_args=["-O3", "-std=c++11"],
+        define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
+    ),
+    Extension(
         "submission._fast",
         sources=["submission/_fast.pyx"],
         include_dirs=[np.get_include()],

@@ -42,6 +42,15 @@ import numpy as np
 from submission._analysis import AnalysisConfig, make_analyzer
 from submission._codecs import vbyte_decode, vbyte_encode, vbyte_widths
 
+# Optional C++ kernel for tokenising and posting emission (see
+# submission/_fastbuild.pyx). Imported behind try/except: without it the build
+# falls back to the pure-Python path and produces the identical index, just
+# more slowly.
+try:
+    from submission import _fastbuild as _FASTBUILD
+except ImportError:  # pragma: no cover - exercised by the fallback test
+    _FASTBUILD = None
+
 FORMAT_VERSION = 1
 
 # Postings accumulated in Python lists before being flushed to NumPy arrays.
@@ -129,7 +138,41 @@ class InvertedIndex:
     def _build(self, docs: Iterable[Tuple[str, str]]) -> None:
         if self.store_positions:
             return self._build_positional(docs)
+        if _FASTBUILD is not None and _FASTBUILD.Builder.supports(self.config):
+            return self._build_counts_fast(docs)
         return self._build_counts(docs)
+
+    def _build_counts_fast(self, docs: Iterable[Tuple[str, str]]) -> None:
+        """Same index as `_build_counts`, with tokenising and posting emission
+        done in C++ (see submission/_fastbuild.pyx).
+
+        Used only when the analysis chain is the default one the kernel
+        reproduces exactly; any other configuration falls back to Python rather
+        than risking a silently different index.
+        """
+        builder = _FASTBUILD.Builder(self.config.min_token_len, self.config.max_token_len)
+        doc_ids: List[str] = []
+        doc_lens: List[int] = []
+        for internal_id, (ext_id, text) in enumerate(docs):
+            doc_ids.append(ext_id)
+            # str.lower() stays in Python: it is already C-speed and applies the
+            # full Unicode case mapping the byte scanner cannot.
+            doc_lens.append(builder.add_document(text.lower().encode("utf-8"), internal_id))
+
+        self.doc_ids = doc_ids
+        self.doc_len = np.array(doc_lens, dtype=np.int64)
+        self.N = len(doc_ids)
+        self.total_tokens = int(self.doc_len.sum()) if self.N else 0
+        self.avg_doc_len = (self.total_tokens / self.N) if self.N else 0.0
+
+        seen_terms, term_ids, docs_arr, tfs_arr = builder.finish()
+        if not seen_terms:
+            self._finalise_empty({})
+            return
+        self._finalise_postings(seen_terms,
+                                term_ids.astype(np.int64),
+                                docs_arr.astype(np.int64),
+                                tfs_arr.astype(np.int64))
 
     def _build_positional(self, docs: Iterable[Tuple[str, str]]) -> None:
         """Build with term positions retained, for proximity/phrase scoring.
@@ -312,6 +355,15 @@ class InvertedIndex:
         # Reassign term ids so they follow alphabetical order. Sorting the terms
         # makes the dictionary compressible (shared prefixes end up adjacent)
         # and makes the build deterministic regardless of corpus order.
+        self._finalise_postings(list(provisional), term_ids, docs_arr, tfs_arr,
+                                first_seen=provisional)
+
+    def _finalise_postings(self, seen_terms, term_ids, docs_arr, tfs_arr,
+                           first_seen=None) -> None:
+        """Sort, group and encode postings. Shared by the Python and C++ paths
+        so both produce a byte-identical index."""
+        provisional = first_seen if first_seen is not None else {
+            t: i for i, t in enumerate(seen_terms)}
         sorted_terms = sorted(provisional)
         remap = np.empty(len(sorted_terms), dtype=np.int64)
         for new_id, term in enumerate(sorted_terms):

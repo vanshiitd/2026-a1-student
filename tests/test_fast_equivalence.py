@@ -146,3 +146,62 @@ def test_bit_identical_on_a_corpus_large_enough_to_expose_fp_contraction(k1, b):
                 "Check the compiler is not contracting a*b+c into an FMA "
                 "(-ffp-contract=off in setup.py)."
             )
+
+
+# ---------------------------------------------------------------------------
+# Build-side kernel (submission/_fastbuild.pyx)
+# ---------------------------------------------------------------------------
+
+def _build_both(corpus, config=None):
+    """Build the same corpus with and without the C++ kernel."""
+    import submission.indexer as ixmod
+    from submission._analysis import AnalysisConfig
+    cfg = config or AnalysisConfig()
+
+    saved = ixmod._FASTBUILD
+    ixmod._FASTBUILD = None
+    py = InvertedIndex(cfg); py.build(corpus)
+    ixmod._FASTBUILD = saved
+    c = InvertedIndex(cfg); c.build(corpus)
+    return py, c
+
+
+def _assert_identical(py, c):
+    assert py.terms == c.terms
+    assert py.doc_ids == c.doc_ids
+    assert (py.N, py.total_tokens, py.avg_doc_len) == (c.N, c.total_tokens, c.avg_doc_len)
+    for name in ("doc_len", "df", "cf", "_docid_buf", "_tf_buf", "_docid_off", "_tf_off"):
+        np.testing.assert_array_equal(getattr(py, name), getattr(c, name),
+                                      err_msg=f"{name} differs between build paths")
+
+
+def test_cpp_builder_produces_a_byte_identical_index():
+    pytest.importorskip("submission._fastbuild")
+    _assert_identical(*_build_both(_synthetic_corpus(400, seed=3)))
+
+
+@pytest.mark.parametrize("corpus", [
+    [("d1", "")],                                     # empty document
+    [("d1", "   !!!   ")],                            # nothing tokenisable
+    [("d1", "a"), ("d2", "a a"), ("d3", "b")],        # minimal
+    [("d1", "COVID-19 SARS-CoV-2 100% α β 你好")],     # punctuation and non-Latin
+    [("d1", "x" * 40 + " ok")],                       # token beyond max_token_len
+    [("d1", "Ω".join(["term"] * 50))],                # non-ASCII separators
+])
+def test_cpp_builder_matches_python_on_awkward_input(corpus):
+    """UTF-8 continuation bytes must never be mistaken for token characters, and
+    the over-long-token filter must drop exactly what the Python analyzer drops
+    -- document length feeds BM25's normalisation, so any drift changes scores."""
+    pytest.importorskip("submission._fastbuild")
+    _assert_identical(*_build_both(corpus))
+
+
+def test_cpp_builder_declines_configs_it_cannot_reproduce():
+    """Stemming and stopword removal are not implemented in the kernel; it must
+    say so rather than silently building a different index."""
+    fb = pytest.importorskip("submission._fastbuild")
+    from submission._analysis import AnalysisConfig
+    assert fb.Builder.supports(AnalysisConfig())
+    assert not fb.Builder.supports(AnalysisConfig(stemmer="porter"))
+    assert not fb.Builder.supports(AnalysisConfig(remove_stopwords=True))
+    assert not fb.Builder.supports(AnalysisConfig(split_alphanum=True))
