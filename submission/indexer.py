@@ -59,6 +59,8 @@ _DOCID_LEN = "docid_len.bin"
 _TF_LEN = "tf_len.bin"
 _POSTINGS_D = "postings_d.bin"
 _POSTINGS_F = "postings_f.bin"
+_POS_LEN = "pos_len.bin"
+_POSITIONS = "positions.bin"
 
 
 def tokenize(text: str) -> List[str]:
@@ -85,8 +87,15 @@ def _iter_jsonl(path: str) -> Iterator[Tuple[str, str]]:
 class InvertedIndex:
     """Inverted index with delta+VByte postings and on-disk persistence."""
 
-    def __init__(self, config: Optional[AnalysisConfig] = None):
+    def __init__(self, config: Optional[AnalysisConfig] = None,
+                 store_positions: bool = False):
         self.config = config or AnalysisConfig()
+        # Positions cost roughly one VByte per token occurrence and are only
+        # needed by proximity/phrase scoring, so they are opt-in: an index built
+        # without them is byte-for-byte what it was before this existed.
+        self.store_positions = store_positions
+        self._pos_buf = np.zeros(0, dtype=np.uint8)
+        self._pos_off = np.zeros(1, dtype=np.int64)
         self.terms: List[str] = []
         self.term_lookup: Dict[str, int] = {}
         self.df = np.zeros(0, dtype=np.int64)
@@ -118,6 +127,133 @@ class InvertedIndex:
         self._build(_iter_jsonl(corpus_path))
 
     def _build(self, docs: Iterable[Tuple[str, str]]) -> None:
+        if self.store_positions:
+            return self._build_positional(docs)
+        return self._build_counts(docs)
+
+    def _build_positional(self, docs: Iterable[Tuple[str, str]]) -> None:
+        """Build with term positions retained, for proximity/phrase scoring.
+
+        Emits one (term, doc, position) triple per token occurrence rather than
+        one (term, doc, tf) triple per distinct term, then recovers tf by
+        grouping. That means term frequency never has to be counted separately:
+        a posting's tf is exactly how many positions it owns, which also means
+        the positions file needs no per-posting offset table -- the existing tf
+        values already delimit it.
+        """
+        analyzer = make_analyzer(self.config)
+        provisional: Dict[str, int] = {}
+        doc_ids: List[str] = []
+        doc_lens: List[int] = []
+
+        buf_t: List[int] = []
+        buf_d: List[int] = []
+        buf_p: List[int] = []
+        chunks: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+
+        def flush() -> None:
+            if not buf_t:
+                return
+            chunks.append((
+                np.array(buf_t, dtype=np.int32),
+                np.array(buf_d, dtype=np.int32),
+                np.array(buf_p, dtype=np.int32),
+            ))
+            buf_t.clear()
+            buf_d.clear()
+            buf_p.clear()
+
+        for internal_id, (ext_id, text) in enumerate(docs):
+            tokens = analyzer(text)
+            doc_ids.append(ext_id)
+            doc_lens.append(len(tokens))
+            for position, term in enumerate(tokens):
+                tid = provisional.get(term)
+                if tid is None:
+                    tid = len(provisional)
+                    provisional[term] = tid
+                buf_t.append(tid)
+                buf_d.append(internal_id)
+                buf_p.append(position)
+            if len(buf_t) >= _FLUSH_EVERY:
+                flush()
+        flush()
+
+        self.doc_ids = doc_ids
+        self.doc_len = np.array(doc_lens, dtype=np.int64)
+        self.N = len(doc_ids)
+        self.total_tokens = int(self.doc_len.sum()) if self.N else 0
+        self.avg_doc_len = (self.total_tokens / self.N) if self.N else 0.0
+
+        if not chunks:
+            self._finalise_empty(provisional)
+            return
+
+        term_ids = np.concatenate([c[0] for c in chunks]).astype(np.int64)
+        docs_arr = np.concatenate([c[1] for c in chunks]).astype(np.int64)
+        positions = np.concatenate([c[2] for c in chunks]).astype(np.int64)
+        del chunks
+
+        sorted_terms = sorted(provisional)
+        remap = np.empty(len(sorted_terms), dtype=np.int64)
+        for new_id, term in enumerate(sorted_terms):
+            remap[provisional[term]] = new_id
+        term_ids = remap[term_ids]
+
+        # Group by term, then doc, then position ascending.
+        order = np.lexsort((positions, docs_arr, term_ids))
+        term_ids = term_ids[order]
+        docs_arr = docs_arr[order]
+        positions = positions[order]
+        del order
+
+        n_tokens = term_ids.size
+        # A new posting begins wherever (term, doc) changes.
+        is_new = np.empty(n_tokens, dtype=bool)
+        is_new[0] = True
+        np.logical_or(term_ids[1:] != term_ids[:-1], docs_arr[1:] != docs_arr[:-1], out=is_new[1:])
+        posting_start = np.flatnonzero(is_new)
+
+        post_term = term_ids[posting_start]
+        post_doc = docs_arr[posting_start]
+        post_tf = np.diff(np.append(posting_start, n_tokens))
+
+        n_terms = len(sorted_terms)
+        self.terms = sorted_terms
+        self.term_lookup = {term: i for i, term in enumerate(sorted_terms)}
+        self.df = np.bincount(post_term, minlength=n_terms).astype(np.int64)
+        self.cf = np.bincount(post_term, weights=post_tf, minlength=n_terms).astype(np.int64)
+
+        term_start = np.empty(n_terms, dtype=np.int64)
+        term_start[0] = 0
+        np.cumsum(self.df[:-1], out=term_start[1:])
+
+        gaps = np.empty(post_doc.size, dtype=np.int64)
+        gaps[0] = post_doc[0]
+        np.subtract(post_doc[1:], post_doc[:-1], out=gaps[1:])
+        gaps[term_start] = post_doc[term_start]
+
+        docid_bytes = np.add.reduceat(vbyte_widths(gaps), term_start)
+        tf_bytes = np.add.reduceat(vbyte_widths(post_tf), term_start)
+        self._docid_buf = vbyte_encode(gaps)
+        self._tf_buf = vbyte_encode(post_tf)
+        self._docid_off = np.concatenate(([0], np.cumsum(docid_bytes))).astype(np.int64)
+        self._tf_off = np.concatenate(([0], np.cumsum(tf_bytes))).astype(np.int64)
+
+        # Positions delta-encoded within each posting (they are ascending there),
+        # restarting the chain at every posting boundary.
+        pos_gaps = np.empty(n_tokens, dtype=np.int64)
+        pos_gaps[0] = positions[0]
+        np.subtract(positions[1:], positions[:-1], out=pos_gaps[1:])
+        pos_gaps[posting_start] = positions[posting_start]
+
+        # Each term's slice of the position buffer starts at its first posting.
+        pos_term_start = posting_start[term_start]
+        pos_bytes = np.add.reduceat(vbyte_widths(pos_gaps), pos_term_start)
+        self._pos_buf = vbyte_encode(pos_gaps)
+        self._pos_off = np.concatenate(([0], np.cumsum(pos_bytes))).astype(np.int64)
+
+    def _build_counts(self, docs: Iterable[Tuple[str, str]]) -> None:
         analyzer = make_analyzer(self.config)  # holds the stem cache across docs
 
         provisional: Dict[str, int] = {}     # term -> first-seen id
@@ -225,6 +361,7 @@ class InvertedIndex:
         self.cf = np.zeros(n, dtype=np.int64)
         self._docid_off = np.zeros(n + 1, dtype=np.int64)
         self._tf_off = np.zeros(n + 1, dtype=np.int64)
+        self._pos_off = np.zeros(n + 1, dtype=np.int64)
 
     # ------------------------------------------------------------------
     # Query-time accessors
@@ -262,6 +399,31 @@ class InvertedIndex:
         tfs = vbyte_decode(self._tf_buf[self._tf_off[tid]:self._tf_off[tid + 1]], count)
         return np.cumsum(gaps), tfs
 
+    def postings_with_positions(self, tid: int):
+        """Decode a term's postings together with its term positions.
+
+        Returns (doc_ids, tfs, positions, offsets) where `positions` is the flat
+        concatenation of every posting's position list and `offsets[i]` is where
+        document i's positions begin. tf doubles as the per-posting length, so
+        no separate offset table is stored on disk.
+        """
+        if not self.store_positions:
+            raise RuntimeError("this index was built without positions")
+        doc_ids, tfs = self.postings_by_id(tid)
+        total = int(self.cf[tid])
+        gaps = vbyte_decode(self._pos_buf[self._pos_off[tid]:self._pos_off[tid + 1]], total)
+
+        offsets = np.empty(tfs.size, dtype=np.int64)
+        offsets[0] = 0
+        np.cumsum(tfs[:-1], out=offsets[1:])
+        # Undo the per-posting delta chains: cumulative sum, minus each
+        # posting's running base.
+        running = np.cumsum(gaps)
+        base = np.zeros(tfs.size, dtype=np.int64)
+        base[1:] = running[offsets[1:] - 1]
+        positions = running - np.repeat(base, tfs)
+        return doc_ids, tfs, positions, offsets
+
     def external_id(self, internal_id: int) -> str:
         return self.doc_ids[internal_id]
 
@@ -284,6 +446,7 @@ class InvertedIndex:
             "total_tokens": self.total_tokens,
             "avg_doc_len": self.avg_doc_len,
             "analysis": self.config.to_dict(),
+            "store_positions": self.store_positions,
         }
         with open(os.path.join(index_dir, _META), "w", encoding="utf-8") as f:
             json.dump(meta, f)
@@ -313,6 +476,10 @@ class InvertedIndex:
         self._docid_buf.tofile(os.path.join(index_dir, _POSTINGS_D))
         self._tf_buf.tofile(os.path.join(index_dir, _POSTINGS_F))
 
+        if self.store_positions:
+            vbyte_encode(np.diff(self._pos_off)).tofile(os.path.join(index_dir, _POS_LEN))
+            self._pos_buf.tofile(os.path.join(index_dir, _POSITIONS))
+
     @classmethod
     def load(cls, index_dir: str) -> "InvertedIndex":
         """Reconstruct an index from `index_dir` alone, in a fresh process."""
@@ -324,7 +491,8 @@ class InvertedIndex:
                 f"{FORMAT_VERSION}; rebuild the index"
             )
 
-        index = cls(AnalysisConfig.from_dict(meta.get("analysis", {})))
+        index = cls(AnalysisConfig.from_dict(meta.get("analysis", {})),
+                    store_positions=bool(meta.get("store_positions", False)))
         index.N = int(meta["n_docs"])
         index.total_tokens = int(meta["total_tokens"])
         index.avg_doc_len = float(meta["avg_doc_len"])
@@ -353,4 +521,9 @@ class InvertedIndex:
 
         index._docid_buf = np.fromfile(os.path.join(index_dir, _POSTINGS_D), dtype=np.uint8)
         index._tf_buf = np.fromfile(os.path.join(index_dir, _POSTINGS_F), dtype=np.uint8)
+
+        if index.store_positions:
+            pos_len = read_vbyte(_POS_LEN, n_terms)
+            index._pos_off = np.concatenate(([0], np.cumsum(pos_len))).astype(np.int64)
+            index._pos_buf = np.fromfile(os.path.join(index_dir, _POSITIONS), dtype=np.uint8)
         return index

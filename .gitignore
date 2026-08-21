@@ -13,3 +13,4 @@ venv/
 .index_cache/
 .index_cache-*/
 experiments/results.jsonl
+.index_cache-positional/
