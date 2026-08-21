@@ -113,10 +113,17 @@ def _score_fast(index, query: str, k: int, k1: float, b: float) -> List[Tuple[st
         if count == 0:
             continue
         hit = True
-        _fast.score_bm25_term(
+        start = int(index._term_start[tid])
+        # Exceptions are stored in ascending posting order, so this term's are a
+        # contiguous slice; the kernel then consumes them in sequence.
+        lo = int(np.searchsorted(index._tf_exc_idx, start))
+        hi = int(np.searchsorted(index._tf_exc_idx, start + count))
+        _fast.score_bm25_term_packed(
             index._docid_buf[index._docid_off[tid]:index._docid_off[tid + 1]],
-            index._tf_buf[index._tf_off[tid]:index._tf_off[tid + 1]],
+            index._tf_packed,
+            start,
             count,
+            np.ascontiguousarray(index._tf_exc_val[lo:hi]),
             index.doc_len,
             scores,
             touched,

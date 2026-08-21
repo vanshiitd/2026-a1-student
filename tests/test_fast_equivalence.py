@@ -61,21 +61,6 @@ def test_c_and_python_paths_are_bit_identical(index, query, k1, b):
         assert sa == sb, f"score differs: {sa!r} vs {sb!r} (query={query!r})"
 
 
-def test_decode_postings_matches_the_numpy_codec(index):
-    """The C decoder must agree with submission/_codecs.py on every term."""
-    for term in index.terms:
-        tid = index.term_id(term)
-        count = int(index.df[tid])
-        py_docs, py_tfs = index.postings_by_id(tid)
-        c_docs, c_tfs = fast.decode_postings(
-            index._docid_buf[index._docid_off[tid]:index._docid_off[tid + 1]],
-            index._tf_buf[index._tf_off[tid]:index._tf_off[tid + 1]],
-            count,
-        )
-        np.testing.assert_array_equal(py_docs, c_docs)
-        np.testing.assert_array_equal(py_tfs, c_tfs)
-
-
 @pytest.mark.parametrize("seed", range(5))
 def test_decode_postings_on_random_wide_gaps(seed):
     """Exercise multi-byte VByte values, which a small toy corpus never reaches."""
@@ -99,11 +84,13 @@ def test_fallback_produces_identical_results_when_extension_is_absent(index, mon
 
 def test_extension_does_not_mutate_the_index(index):
     """The kernel writes into caller-owned score buffers only."""
-    before = (index._docid_buf.copy(), index._tf_buf.copy(), index.doc_len.copy())
+    before = (index._docid_buf.copy(), index._tf_packed.copy(),
+              index._tf_exc_val.copy(), index.doc_len.copy())
     bm25.score("alpha beta gamma", 10, k1=4.5, b=0.60)
     np.testing.assert_array_equal(before[0], index._docid_buf)
-    np.testing.assert_array_equal(before[1], index._tf_buf)
-    np.testing.assert_array_equal(before[2], index.doc_len)
+    np.testing.assert_array_equal(before[1], index._tf_packed)
+    np.testing.assert_array_equal(before[2], index._tf_exc_val)
+    np.testing.assert_array_equal(before[3], index.doc_len)
 
 
 def _synthetic_corpus(n_docs=1500, seed=0):
@@ -170,7 +157,8 @@ def _assert_identical(py, c):
     assert py.terms == c.terms
     assert py.doc_ids == c.doc_ids
     assert (py.N, py.total_tokens, py.avg_doc_len) == (c.N, c.total_tokens, c.avg_doc_len)
-    for name in ("doc_len", "df", "cf", "_docid_buf", "_tf_buf", "_docid_off", "_tf_off"):
+    for name in ("doc_len", "df", "cf", "_docid_buf", "_docid_off",
+                 "_tf_packed", "_tf_exc_idx", "_tf_exc_val", "_term_start"):
         np.testing.assert_array_equal(getattr(py, name), getattr(c, name),
                                       err_msg=f"{name} differs between build paths")
 

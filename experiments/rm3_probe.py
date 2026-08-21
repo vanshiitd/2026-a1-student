@@ -42,7 +42,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from harness.metrics import ndcg_at_k
 from experiments.evaluate import cv_folds, load_topics, paired_bootstrap
 from submission._analysis import analyze
-from submission._codecs import vbyte_decode
+from submission._codecs import unpack_tf_nibbles, vbyte_decode
 from submission._scorers import robertson_idf
 from submission.indexer import InvertedIndex
 
@@ -52,7 +52,8 @@ def build_forward_in_memory(index):
     n_terms = len(index.terms)
     total = int(index.df.sum())
     gaps = vbyte_decode(index._docid_buf, total)
-    tfs = vbyte_decode(index._tf_buf, total)
+    tfs = unpack_tf_nibbles(index._tf_packed, 0, total,
+                            index._tf_exc_idx, index._tf_exc_val)
 
     term_of = np.repeat(np.arange(n_terms, dtype=np.int64), index.df)
     starts = np.empty(n_terms, dtype=np.int64)

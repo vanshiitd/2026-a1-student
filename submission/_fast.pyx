@@ -111,3 +111,47 @@ def decode_postings(const uint8_t[::1] docid_buf,
             dv[n] = docid
             fv[n] = <int64_t>_read_vbyte(tf_buf, &fpos)
     return docs, tfs
+
+
+def score_bm25_term_packed(const uint8_t[::1] docid_buf,
+                           const uint8_t[::1] tf_packed,
+                           Py_ssize_t tf_start,
+                           Py_ssize_t count,
+                           const int64_t[::1] exc_val,
+                           const int64_t[::1] doc_len,
+                           double[::1] scores,
+                           uint8_t[::1] touched,
+                           double idf,
+                           double k1,
+                           double b,
+                           double avgdl):
+    """As `score_bm25_term`, reading nibble-packed term frequencies.
+
+    A posting's nibble index is its posting index, so `tf_start` (the term's
+    first posting) is all the offset information needed -- there is no per-term
+    tf offset table. A zero nibble is the escape code meaning "this tf is in the
+    exception list"; exceptions are visited in order, so `exc_val` is simply the
+    slice of exceptions belonging to this term.
+    """
+    cdef Py_ssize_t dpos = 0, n, j, exc_i = 0
+    cdef int64_t docid = 0
+    cdef double tf, dl, norm
+    cdef double k1_plus_1 = k1 + 1.0
+    cdef double one_minus_b = 1.0 - b
+    cdef uint8_t byte, nib
+
+    with nogil:
+        for n in range(count):
+            docid += <int64_t>_read_vbyte(docid_buf, &dpos)
+            j = tf_start + n
+            byte = tf_packed[j >> 1]
+            nib = (byte >> 4) if (j & 1) else (byte & 0x0F)
+            if nib == 0:
+                tf = <double>exc_val[exc_i]
+                exc_i += 1
+            else:
+                tf = <double>nib
+            dl = <double>doc_len[docid]
+            norm = k1 * (one_minus_b + b * (dl / avgdl))
+            scores[docid] += idf * (tf * k1_plus_1) / (tf + norm)
+            touched[docid] = 1

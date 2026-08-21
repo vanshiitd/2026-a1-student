@@ -62,9 +62,14 @@ cdef class Builder:
     cdef vector[string] term_bytes          # term id -> its bytes, for the dictionary
     cdef vector[int] scratch_tf             # term id -> tf within the current document
     cdef vector[int] touched                # term ids used by the current document
-    cdef vector[int32_t] out_terms
-    cdef vector[int32_t] out_docs
-    cdef vector[int32_t] out_tfs
+    # Postings held per term rather than in one document-ordered stream. This
+    # is what removes the global sort: documents are processed in ascending id
+    # order, so each term's doc list is built already ascending, and grouping by
+    # term is exactly what a per-term vector is. The previous layout needed a
+    # 16.3M-element np.lexsort afterwards to recover both properties -- 3.06s of
+    # a 5.78s build.
+    cdef vector[vector[int32_t]] post_docs
+    cdef vector[vector[int32_t]] post_tfs
     cdef Py_ssize_t max_token_len
     cdef Py_ssize_t min_token_len
 
@@ -119,6 +124,8 @@ cdef class Builder:
                 self.vocab[key] = tid
                 self.term_bytes.push_back(key)
                 self.scratch_tf.push_back(0)
+                self.post_docs.push_back(vector[int32_t]())
+                self.post_tfs.push_back(vector[int32_t]())
             else:
                 tid = deref(it).second
 
@@ -129,34 +136,49 @@ cdef class Builder:
         # Flush this document's postings, resetting only what was touched.
         for j in range(<Py_ssize_t>self.touched.size()):
             t = self.touched[j]
-            self.out_terms.push_back(<int32_t>t)
-            self.out_docs.push_back(<int32_t>doc_id)
-            self.out_tfs.push_back(<int32_t>self.scratch_tf[t])
+            self.post_docs[t].push_back(<int32_t>doc_id)
+            self.post_tfs[t].push_back(<int32_t>self.scratch_tf[t])
             self.scratch_tf[t] = 0
         return n_tokens
 
-    def finish(self):
-        """Return (terms, term_ids, doc_ids, tfs).
+    def terms(self):
+        """Vocabulary in first-seen order, as Python strings."""
+        cdef Py_ssize_t v = <Py_ssize_t>self.term_bytes.size()
+        cdef Py_ssize_t i
+        out = [None] * v
+        for i in range(v):
+            out[i] = self.term_bytes[i].decode("utf-8")
+        return out
 
-        `terms` is a Python list of str in first-seen order; the caller sorts it
-        and remaps ids exactly as the pure-Python path does.
+    def finish_sorted(self, const int32_t[::1] order):
+        """Concatenate postings in sorted-term order. Returns (docs, tfs, df).
+
+        `order[i]` is the original term id of the i-th alphabetically-sorted
+        term. Walking terms in that order and copying each one's vector produces
+        exactly the layout the encoder wants -- grouped by term, ascending by
+        doc id within a term -- in a single pass, with no sort anywhere.
         """
-        cdef Py_ssize_t m = <Py_ssize_t>self.out_terms.size()
-        terms_arr = np.empty(m, dtype=np.int32)
-        docs_arr = np.empty(m, dtype=np.int32)
-        tfs_arr = np.empty(m, dtype=np.int32)
-        cdef int32_t[::1] tv = terms_arr
+        cdef Py_ssize_t n_terms = order.shape[0]
+        cdef Py_ssize_t i, j, t, total = 0, pos = 0
+
+        for i in range(n_terms):
+            total += <Py_ssize_t>self.post_docs[order[i]].size()
+
+        docs_arr = np.empty(total, dtype=np.int32)
+        tfs_arr = np.empty(total, dtype=np.int32)
+        df_arr = np.empty(n_terms, dtype=np.int64)
         cdef int32_t[::1] dv = docs_arr
         cdef int32_t[::1] fv = tfs_arr
-        cdef Py_ssize_t i
-        with nogil:
-            for i in range(m):
-                tv[i] = self.out_terms[i]
-                dv[i] = self.out_docs[i]
-                fv[i] = self.out_tfs[i]
+        cdef long long[::1] df = df_arr
+        cdef Py_ssize_t m
 
-        cdef Py_ssize_t v = <Py_ssize_t>self.term_bytes.size()
-        terms = [None] * v
-        for i in range(v):
-            terms[i] = self.term_bytes[i].decode("utf-8")
-        return terms, terms_arr, docs_arr, tfs_arr
+        with nogil:
+            for i in range(n_terms):
+                t = order[i]
+                m = <Py_ssize_t>self.post_docs[t].size()
+                df[i] = m
+                for j in range(m):
+                    dv[pos] = self.post_docs[t][j]
+                    fv[pos] = self.post_tfs[t][j]
+                    pos += 1
+        return docs_arr, tfs_arr, df_arr

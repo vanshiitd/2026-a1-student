@@ -36,7 +36,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from submission._analysis import analyze
-from submission._codecs import vbyte_decode
+from submission._codecs import unpack_tf_nibbles, vbyte_decode
 from submission.indexer import InvertedIndex
 
 _INDEX: Optional[InvertedIndex] = None
@@ -86,7 +86,8 @@ def _decode_all_postings(index: InvertedIndex) -> Tuple[np.ndarray, np.ndarray, 
         return empty, empty, empty
 
     gaps = vbyte_decode(index._docid_buf, total)
-    tfs = vbyte_decode(index._tf_buf, total)
+    tfs = unpack_tf_nibbles(index._tf_packed, 0, total,
+                            index._tf_exc_idx, index._tf_exc_val)
 
     term_of_posting = np.repeat(np.arange(n_terms, dtype=np.int64), index.df)
 

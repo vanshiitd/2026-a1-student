@@ -15,7 +15,8 @@ quantity lives in a flat NumPy array:
     terms[t]                 term string, sorted ascending
     df[t], cf[t]             document frequency, collection frequency
     docid_off[t:t+2]         byte slice of this term's docids in `_docid_buf`
-    tf_off[t:t+2]            byte slice of this term's tfs in `_tf_buf`
+    term_start[t]            index of this term's first posting; also its
+                             nibble offset into the packed tf array
     doc_len[d]               document length in tokens
     doc_ids[d]               external doc_id string for internal id d
 
@@ -40,7 +41,8 @@ from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 import numpy as np
 
 from submission._analysis import AnalysisConfig, make_analyzer
-from submission._codecs import vbyte_decode, vbyte_encode, vbyte_widths
+from submission._codecs import (pack_tf_nibbles, unpack_tf_nibbles, vbyte_decode,
+                                vbyte_encode, vbyte_widths)
 
 # Optional C++ kernel for tokenising and posting emission (see
 # submission/_fastbuild.pyx). Imported behind try/except: without it the build
@@ -51,7 +53,7 @@ try:
 except ImportError:  # pragma: no cover - exercised by the fallback test
     _FASTBUILD = None
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2   # 2: term frequencies nibble-packed
 
 # Postings accumulated in Python lists before being flushed to NumPy arrays.
 # Bounds peak interpreter memory during the build without making the flush
@@ -65,9 +67,10 @@ _DF = "df.bin"
 _CF = "cf.bin"
 _DOCLEN = "doclen.bin"
 _DOCID_LEN = "docid_len.bin"
-_TF_LEN = "tf_len.bin"
+_TF_NIB = "tf_nib.bin"
+_TF_EXC_I = "tf_exc_idx.bin"
+_TF_EXC_V = "tf_exc_val.bin"
 _POSTINGS_D = "postings_d.bin"
-_POSTINGS_F = "postings_f.bin"
 _POS_LEN = "pos_len.bin"
 _POSITIONS = "positions.bin"
 
@@ -115,9 +118,14 @@ class InvertedIndex:
         self.total_tokens: int = 0
         self.avg_doc_len: float = 0.0
         self._docid_buf = np.zeros(0, dtype=np.uint8)
-        self._tf_buf = np.zeros(0, dtype=np.uint8)
         self._docid_off = np.zeros(1, dtype=np.int64)
-        self._tf_off = np.zeros(1, dtype=np.int64)
+        # Term frequencies are nibble-packed (see submission/_codecs.py). No
+        # per-term offset table is needed: a posting's nibble index is its
+        # posting index, which `_term_start` (cumulative df) already gives.
+        self._tf_packed = np.zeros(0, dtype=np.uint8)
+        self._tf_exc_idx = np.zeros(0, dtype=np.int64)
+        self._tf_exc_val = np.zeros(0, dtype=np.int64)
+        self._term_start = np.zeros(0, dtype=np.int64)
 
     # ------------------------------------------------------------------
     # Build
@@ -165,14 +173,48 @@ class InvertedIndex:
         self.total_tokens = int(self.doc_len.sum()) if self.N else 0
         self.avg_doc_len = (self.total_tokens / self.N) if self.N else 0.0
 
-        seen_terms, term_ids, docs_arr, tfs_arr = builder.finish()
-        if not seen_terms:
+        terms_unsorted = builder.terms()
+        if not terms_unsorted:
             self._finalise_empty({})
             return
-        self._finalise_postings(seen_terms,
-                                term_ids.astype(np.int64),
-                                docs_arr.astype(np.int64),
-                                tfs_arr.astype(np.int64))
+
+        # Sort the vocabulary, then have the kernel concatenate postings in that
+        # order. This replaces the 16.3M-element np.lexsort the document-ordered
+        # layout required -- 3.06s of a 5.78s build -- with a single copy pass.
+        order = sorted(range(len(terms_unsorted)), key=terms_unsorted.__getitem__)
+        sorted_terms = [terms_unsorted[i] for i in order]
+        docs_arr, tfs_arr, df = builder.finish_sorted(np.asarray(order, dtype=np.int32))
+
+        self.terms = sorted_terms
+        self.term_lookup = {term: i for i, term in enumerate(sorted_terms)}
+        self.df = df
+        self.cf = np.zeros(len(sorted_terms), dtype=np.int64)
+        np.add.reduceat(tfs_arr.astype(np.int64), self._term_starts(df), out=self.cf)
+        self._encode_postings(docs_arr.astype(np.int64), tfs_arr.astype(np.int64))
+
+    @staticmethod
+    def _term_starts(df: np.ndarray) -> np.ndarray:
+        """Index of each term's first posting. Every term has df >= 1, so the
+        cumulative document frequency gives this directly."""
+        starts = np.empty(df.size, dtype=np.int64)
+        starts[0] = 0
+        np.cumsum(df[:-1], out=starts[1:])
+        return starts
+
+    def _encode_postings(self, post_doc: np.ndarray, post_tf: np.ndarray) -> None:
+        """Delta+VByte encode postings that are already grouped by term and
+        ascending by doc id within each term."""
+        term_start = self._term_starts(self.df)
+        gaps = np.empty(post_doc.size, dtype=np.int64)
+        gaps[0] = post_doc[0]
+        np.subtract(post_doc[1:], post_doc[:-1], out=gaps[1:])
+        gaps[term_start] = post_doc[term_start]
+
+        docid_bytes = np.add.reduceat(vbyte_widths(gaps), term_start)
+        self._docid_buf = vbyte_encode(gaps)
+        self._docid_off = np.concatenate(([0], np.cumsum(docid_bytes))).astype(np.int64)
+        self._term_start = term_start
+        self._tf_packed, self._tf_exc_idx, self._tf_exc_val = pack_tf_nibbles(post_tf)
 
     def _build_positional(self, docs: Iterable[Tuple[str, str]]) -> None:
         """Build with term positions retained, for proximity/phrase scoring.
@@ -277,11 +319,10 @@ class InvertedIndex:
         gaps[term_start] = post_doc[term_start]
 
         docid_bytes = np.add.reduceat(vbyte_widths(gaps), term_start)
-        tf_bytes = np.add.reduceat(vbyte_widths(post_tf), term_start)
         self._docid_buf = vbyte_encode(gaps)
-        self._tf_buf = vbyte_encode(post_tf)
         self._docid_off = np.concatenate(([0], np.cumsum(docid_bytes))).astype(np.int64)
-        self._tf_off = np.concatenate(([0], np.cumsum(tf_bytes))).astype(np.int64)
+        self._term_start = term_start
+        self._tf_packed, self._tf_exc_idx, self._tf_exc_val = pack_tf_nibbles(post_tf)
 
         # Positions delta-encoded within each posting (they are ascending there),
         # restarting the chain at every posting boundary.
@@ -398,12 +439,10 @@ class InvertedIndex:
 
         # Per-term byte lengths, computed without encoding term-by-term.
         docid_bytes = np.add.reduceat(vbyte_widths(gaps), starts)
-        tf_bytes = np.add.reduceat(vbyte_widths(tfs_arr), starts)
-
         self._docid_buf = vbyte_encode(gaps)
-        self._tf_buf = vbyte_encode(tfs_arr)
         self._docid_off = np.concatenate(([0], np.cumsum(docid_bytes))).astype(np.int64)
-        self._tf_off = np.concatenate(([0], np.cumsum(tf_bytes))).astype(np.int64)
+        self._term_start = starts
+        self._tf_packed, self._tf_exc_idx, self._tf_exc_val = pack_tf_nibbles(tfs_arr)
 
     def _finalise_empty(self, provisional: Dict[str, int]) -> None:
         self.terms = sorted(provisional)
@@ -412,7 +451,7 @@ class InvertedIndex:
         self.df = np.zeros(n, dtype=np.int64)
         self.cf = np.zeros(n, dtype=np.int64)
         self._docid_off = np.zeros(n + 1, dtype=np.int64)
-        self._tf_off = np.zeros(n + 1, dtype=np.int64)
+        self._term_start = np.zeros(n, dtype=np.int64)
         self._pos_off = np.zeros(n + 1, dtype=np.int64)
 
     # ------------------------------------------------------------------
@@ -448,7 +487,8 @@ class InvertedIndex:
         """`postings()` for an already-resolved term id."""
         count = int(self.df[tid])
         gaps = vbyte_decode(self._docid_buf[self._docid_off[tid]:self._docid_off[tid + 1]], count)
-        tfs = vbyte_decode(self._tf_buf[self._tf_off[tid]:self._tf_off[tid + 1]], count)
+        tfs = unpack_tf_nibbles(self._tf_packed, int(self._term_start[tid]), count,
+                                self._tf_exc_idx, self._tf_exc_val)
         return np.cumsum(gaps), tfs
 
     def postings_with_positions(self, tid: int):
@@ -499,6 +539,7 @@ class InvertedIndex:
             "avg_doc_len": self.avg_doc_len,
             "analysis": self.config.to_dict(),
             "store_positions": self.store_positions,
+            "n_tf_exceptions": int(self._tf_exc_idx.size),
         }
         with open(os.path.join(index_dir, _META), "w", encoding="utf-8") as f:
             json.dump(meta, f)
@@ -514,19 +555,21 @@ class InvertedIndex:
         # small integers that VByte to ~1 byte, while absolute offsets grow to
         # 4-5 bytes each. Reconstructed by cumsum at load.
         docid_len = np.diff(self._docid_off)
-        tf_len = np.diff(self._tf_off)
 
         for name, arr in (
             (_DF, self.df),
             (_CF, self.cf),
             (_DOCLEN, self.doc_len),
             (_DOCID_LEN, docid_len),
-            (_TF_LEN, tf_len),
         ):
             vbyte_encode(arr).tofile(os.path.join(index_dir, name))
 
         self._docid_buf.tofile(os.path.join(index_dir, _POSTINGS_D))
-        self._tf_buf.tofile(os.path.join(index_dir, _POSTINGS_F))
+        self._tf_packed.tofile(os.path.join(index_dir, _TF_NIB))
+        # Exception positions are ascending, so gap-encode them like doc ids.
+        exc_gaps = np.diff(self._tf_exc_idx, prepend=0) if self._tf_exc_idx.size else self._tf_exc_idx
+        vbyte_encode(exc_gaps).tofile(os.path.join(index_dir, _TF_EXC_I))
+        vbyte_encode(self._tf_exc_val).tofile(os.path.join(index_dir, _TF_EXC_V))
 
         if self.store_positions:
             vbyte_encode(np.diff(self._pos_off)).tofile(os.path.join(index_dir, _POS_LEN))
@@ -567,12 +610,14 @@ class InvertedIndex:
         index.doc_len = read_vbyte(_DOCLEN, index.N)
 
         docid_len = read_vbyte(_DOCID_LEN, n_terms)
-        tf_len = read_vbyte(_TF_LEN, n_terms)
         index._docid_off = np.concatenate(([0], np.cumsum(docid_len))).astype(np.int64)
-        index._tf_off = np.concatenate(([0], np.cumsum(tf_len))).astype(np.int64)
+        index._term_start = cls._term_starts(index.df) if n_terms else np.zeros(0, dtype=np.int64)
 
         index._docid_buf = np.fromfile(os.path.join(index_dir, _POSTINGS_D), dtype=np.uint8)
-        index._tf_buf = np.fromfile(os.path.join(index_dir, _POSTINGS_F), dtype=np.uint8)
+        index._tf_packed = np.fromfile(os.path.join(index_dir, _TF_NIB), dtype=np.uint8)
+        n_exc = int(meta.get("n_tf_exceptions", 0))
+        index._tf_exc_idx = np.cumsum(read_vbyte(_TF_EXC_I, n_exc)) if n_exc else np.zeros(0, dtype=np.int64)
+        index._tf_exc_val = read_vbyte(_TF_EXC_V, n_exc) if n_exc else np.zeros(0, dtype=np.int64)
 
         if index.store_positions:
             pos_len = read_vbyte(_POS_LEN, n_terms)
