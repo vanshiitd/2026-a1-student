@@ -133,13 +133,10 @@ def _score_fast(index, query: str, k: int, k1: float, b: float) -> List[Tuple[st
     if not hit:
         return []
 
-    candidates = np.flatnonzero(touched)
+    # Single-pass top-k in C. Avoids flatnonzero + gather + argpartition over a
+    # candidate set that is typically ~89% of the collection.
+    candidates, values = _fast.select_top_k(scores, touched, k)
     if candidates.size == 0:
         return []
-    values = scores[candidates]
-    if candidates.size > k:
-        top = np.argpartition(-values, k - 1)[:k]
-        candidates, values = candidates[top], values[top]
-    # Same deterministic tie-break as _traverse._top_k: score desc, doc id asc.
-    order = np.lexsort((candidates, -values))
-    return [(index.doc_ids[int(candidates[i])], float(values[i])) for i in order]
+    return [(index.doc_ids[int(candidates[i])], float(values[i]))
+            for i in range(candidates.size)]

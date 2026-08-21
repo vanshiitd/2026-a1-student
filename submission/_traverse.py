@@ -116,13 +116,14 @@ def _top_k(index, candidates: np.ndarray, scores: np.ndarray, k: int) -> List[Tu
     if candidates.size == 0 or k <= 0:
         return []
     cand_scores = scores[candidates]
-    if candidates.size > k:
-        # argpartition is O(n) vs O(n log n) for a full sort; we only need the
-        # top k, and the exact order within them is fixed by the lexsort below.
-        top = np.argpartition(-cand_scores, k - 1)[:k]
-        candidates = candidates[top]
-        cand_scores = cand_scores[top]
-    order = np.lexsort((candidates, -cand_scores))
+    # Full lexsort rather than argpartition-then-sort. argpartition is O(n) and
+    # faster, but when the k-th and (k+1)-th scores TIE it picks between them
+    # arbitrarily, so it disagreed with the C kernel on 3 of 50 dev topics --
+    # same scores, same nDCG, different tied document at rank 10. Sorting the
+    # whole candidate set by (score desc, doc id asc) makes the boundary
+    # deterministic and matches the kernel exactly. This is the fallback path,
+    # so the extra cost is irrelevant.
+    order = np.lexsort((candidates, -cand_scores))[:k]
     return [(index.doc_ids[int(candidates[i])], float(cand_scores[i])) for i in order]
 
 

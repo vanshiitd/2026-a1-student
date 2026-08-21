@@ -197,10 +197,7 @@ def vsm_score(query: str, k: int) -> List[Tuple[str, float]]:
         where=denom > 0,
     )
 
-    if candidates.size > k:
-        top = np.argpartition(-cand_scores, k - 1)[:k]
-        candidates = candidates[top]
-        cand_scores = cand_scores[top]
-    # Deterministic tie-break on ascending internal document id.
-    order = np.lexsort((candidates, -cand_scores))
+    # Deterministic tie-break on ascending internal document id, including at
+    # the k-th/(k+1)-th boundary where argpartition would choose arbitrarily.
+    order = np.lexsort((candidates, -cand_scores))[:k]
     return [(index.doc_ids[int(candidates[i])], float(cand_scores[i])) for i in order]

@@ -16,11 +16,11 @@
     "note": "This is nDCG@10 and MAP@10 combined at their 70%/10% weights (80% of the total). The remaining \u00b110% efficiency modifier and 0-10% index-size score are both computed relative to the whole class and are applied when course staff aggregate the real leaderboard."
   },
   "efficiency": {
-    "index_build_seconds": 2.660060499969404,
-    "index_load_seconds": 0.08553612499963492,
+    "index_build_seconds": 2.760137000004761,
+    "index_load_seconds": 0.08394749998115003,
     "index_size_bytes": 21566338,
-    "mean_query_latency_seconds": 0.0017285658582113683,
-    "max_query_latency_seconds": 0.002328791015315801
+    "mean_query_latency_seconds": 0.0007630541617982089,
+    "max_query_latency_seconds": 0.0012290420127101243
   },
   "per_query_metrics": {
     "1": {

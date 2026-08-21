@@ -161,10 +161,10 @@ class QueryPostings:
                 stats, **prior_params
             )
         cand_scores = scores[candidates]
-        if candidates.size > k:
-            top = np.argpartition(-cand_scores, k - 1)[:k]
-            candidates, cand_scores = candidates[top], cand_scores[top]
-        order = np.lexsort((candidates, -cand_scores))
+        # Tie-safe selection, matching submission/_traverse.py: argpartition
+        # breaks k-th/(k+1)-th ties arbitrarily, which made sweep results
+        # disagree with the shipped scorer on tied boundaries.
+        order = np.lexsort((candidates, -cand_scores))[:k]
         return [(index.doc_ids[int(candidates[i])], float(cand_scores[i])) for i in order]
 
 

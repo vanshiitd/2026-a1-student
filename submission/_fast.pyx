@@ -155,3 +155,70 @@ def score_bm25_term_packed(const uint8_t[::1] docid_buf,
             norm = k1 * (one_minus_b + b * (dl / avgdl))
             scores[docid] += idf * (tf * k1_plus_1) / (tf + norm)
             touched[docid] = 1
+
+
+def select_top_k(const double[::1] scores,
+                 const uint8_t[::1] touched,
+                 int k):
+    """Top-k in one pass, without materialising the candidate set.
+
+    The NumPy route -- flatnonzero(touched), gather scores, argpartition -- makes
+    three passes over the candidates and allocates two arrays the size of the
+    candidate set. On this collection a typical query touches ~152,000 of
+    171,000 documents, so that dominated query time (1.18ms of 1.78ms) purely to
+    find ten results.
+
+    This keeps a sorted array of the best k seen so far, ascending by score. For
+    k=10 linear insertion beats a heap: the branch is only taken when a document
+    beats the current k-th best, which after the first few hundred documents is
+    rare, and ten shifts is cheaper than sift-down bookkeeping.
+
+    Ties break on ascending document id, matching the NumPy path: documents are
+    scanned in id order and a tie does NOT displace the incumbent, so the
+    earlier id survives.
+    """
+    cdef Py_ssize_t n = scores.shape[0]
+    cdef Py_ssize_t i, j
+    cdef int filled = 0
+    cdef double s
+
+    if k <= 0 or n == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
+
+    cdef cnp.ndarray[double, ndim=1] best_s = np.empty(k, dtype=np.float64)
+    cdef cnp.ndarray[int64_t, ndim=1] best_i = np.empty(k, dtype=np.int64)
+    cdef double[::1] bs = best_s
+    cdef int64_t[::1] bi = best_i
+
+    with nogil:
+        for i in range(n):
+            if touched[i] == 0:
+                continue
+            s = scores[i]
+            if filled < k:
+                # Insert into the ascending-by-score prefix.
+                j = filled
+                # >= not > : the array is ascending and gets reversed on return,
+                # so a new equal score must be placed BEFORE the incumbent here
+                # to end up AFTER it in the result. Documents are scanned in
+                # ascending id order, so this is what makes ties resolve to the
+                # smaller id, matching np.lexsort((cand, -values)).
+                while j > 0 and bs[j - 1] >= s:
+                    bs[j] = bs[j - 1]
+                    bi[j] = bi[j - 1]
+                    j -= 1
+                bs[j] = s
+                bi[j] = i
+                filled += 1
+            elif s > bs[0]:
+                # Strictly greater, so an equal score never evicts an earlier id.
+                j = 0
+                while j + 1 < k and bs[j + 1] < s:
+                    bs[j] = bs[j + 1]
+                    bi[j] = bi[j + 1]
+                    j += 1
+                bs[j] = s
+                bi[j] = i
+
+    # Stored ascending; the caller wants best first.
+    return best_i[:filled][::-1].copy(), best_s[:filled][::-1].copy()
