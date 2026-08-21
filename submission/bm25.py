@@ -34,8 +34,27 @@ assignment-facing entrypoint for it.
 """
 from typing import List, Optional, Tuple
 
+import numpy as np
+
 from submission import _traverse
+from submission._analysis import analyze
+from submission._scorers import robertson_idf
 from submission.indexer import InvertedIndex
+
+# Optional C extension (submission/_fast.pyx), built at image-build time by
+# setup.py. It fuses VByte decoding with BM25 scoring into a single pass;
+# profiling put ~90% of query time in the phases it replaces.
+#
+# Imported behind try/except on purpose: if it was not compiled for any reason,
+# scoring silently falls back to the pure-NumPy path below and the submission
+# still runs correctly, just slower. Speed is never allowed to become a
+# correctness dependency.
+try:
+    from submission import _fast
+    HAVE_FAST = True
+except ImportError:  # pragma: no cover - exercised by the fallback test
+    _fast = None
+    HAVE_FAST = False
 
 _INDEX: Optional[InvertedIndex] = None
 
@@ -57,4 +76,63 @@ def score(query: str, k: int, k1: float = 1.2, b: float = 0.75) -> List[Tuple[st
     highest score first."""
     if _INDEX is None:
         raise RuntimeError("bm25.build(index) must be called before bm25.score()")
+    if HAVE_FAST:
+        return _score_fast(_INDEX, query, k, k1, b)
     return _traverse.score_single(_INDEX, query, "bm25", k, k1=k1, b=b)
+
+
+def _score_fast(index, query: str, k: int, k1: float, b: float) -> List[Tuple[str, float]]:
+    """BM25 via the fused C kernel.
+
+    Produces bit-identical scores to the NumPy path -- the kernel performs the
+    same operations in the same order, and the extension is compiled without
+    -ffast-math so the compiler may not reassociate them. Verified over the full
+    dev set by tests/test_fast_equivalence.py.
+    """
+    if k <= 0:
+        return []
+    # Insertion order, NOT set order. Float addition is not associative, so
+    # accumulating a document's per-term contributions in a different sequence
+    # yields a different float64 result -- a 2-ULP divergence that the
+    # equivalence test caught. _traverse uses Counter(...).items(), which is
+    # insertion-ordered, so this must match it exactly.
+    terms = list(dict.fromkeys(analyze(query, index.config)))
+    if not terms:
+        return []
+
+    scores = np.zeros(index.N, dtype=np.float64)
+    touched = np.zeros(index.N, dtype=np.uint8)
+    avgdl = index.avg_doc_len or 1.0
+    hit = False
+
+    for term in terms:
+        tid = index.term_id(term)
+        if tid < 0:
+            continue
+        count = int(index.df[tid])
+        if count == 0:
+            continue
+        hit = True
+        _fast.score_bm25_term(
+            index._docid_buf[index._docid_off[tid]:index._docid_off[tid + 1]],
+            index._tf_buf[index._tf_off[tid]:index._tf_off[tid + 1]],
+            count,
+            index.doc_len,
+            scores,
+            touched,
+            robertson_idf(count, index.N),
+            k1, b, avgdl,
+        )
+    if not hit:
+        return []
+
+    candidates = np.flatnonzero(touched)
+    if candidates.size == 0:
+        return []
+    values = scores[candidates]
+    if candidates.size > k:
+        top = np.argpartition(-values, k - 1)[:k]
+        candidates, values = candidates[top], values[top]
+    # Same deterministic tie-break as _traverse._top_k: score desc, doc id asc.
+    order = np.lexsort((candidates, -values))
+    return [(index.doc_ids[int(candidates[i])], float(values[i])) for i in order]

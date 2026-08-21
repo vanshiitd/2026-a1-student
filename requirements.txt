@@ -23,6 +23,11 @@ nltk>=3.8
 # Using pybind11 instead of Cython is also fine — add it here yourself.
 Cython>=3.0
 
+# Needed to compile the Cython extension at image-build time. python:*-slim
+# images do not always ship setuptools, and without it `setup.py build_ext`
+# cannot run in the grading image.
+setuptools>=68.0
+
 # Needed only for scripts/download_full_corpus.py (fetching the real
 # assignment corpus). Not required to run the toy set or the harness itself.
 ir_datasets>=0.5.5

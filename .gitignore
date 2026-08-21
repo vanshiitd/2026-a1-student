@@ -15,3 +15,6 @@ venv/
 experiments/results.jsonl
 .index_cache-positional/
 dist/
+build/
+*.so
+submission/_fast.c
