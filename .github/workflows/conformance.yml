@@ -42,7 +42,7 @@ jobs:
       # postings codec that silently round-trips wrong. These are the tests that
       # cover the graded "correctness of required components".
       - name: Component correctness tests (codecs, BM25, Boolean/VSM)
-        run: pytest tests/test_codecs.py tests/test_ranking_components.py tests/test_fast_equivalence.py -v
+        run: pytest tests/test_codecs.py tests/test_ranking_components.py tests/test_fast_equivalence.py tests/test_forward_index.py tests/test_rm3_strategy.py -v
 
       - name: Full harness smoke run (toy set)
         run: |

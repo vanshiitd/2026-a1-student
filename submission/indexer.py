@@ -121,6 +121,11 @@ class InvertedIndex:
         # needed by proximity/phrase scoring, so they are opt-in: an index built
         # without them is byte-for-byte what it was before this existed.
         self.store_positions = store_positions
+        # A forward (doc -> terms) index, needed only by pseudo-relevance
+        # feedback (submission/rm3.py). Off by default: it is real extra disk
+        # and build time, and the shipped configuration never needs it.
+        self.store_forward = False
+        self.forward = None  # submission._forward.ForwardIndex, once built/loaded
         self._prefix_tokens = -1
         # The pseudo-title index shares the main index's document order, so it
         # does not need its own copy of the external doc-id strings (1.5MB).
@@ -170,6 +175,15 @@ class InvertedIndex:
     def _build(self, docs: Iterable[Tuple[str, str]]) -> None:
         if self.store_positions:
             return self._build_positional(docs)
+        # The forward index is built inside _finalise_postings(), which only
+        # the Python path calls; _build_counts_fast() bypasses it entirely for
+        # speed. Route there whenever a forward index was requested, exactly
+        # as store_positions already forces the positional path. In practice
+        # this never costs anything: the only chain that requests a forward
+        # index (the stemmed RM3 chain, submission/rm3.py) already uses the
+        # Python path anyway, since the C++ builder declines stemmed configs.
+        if self.store_forward:
+            return self._build_counts(docs)
         if _FASTBUILD is not None and _FASTBUILD.Builder.supports(self.config):
             return self._build_counts_fast(docs)
         return self._build_counts(docs)
@@ -438,6 +452,15 @@ class InvertedIndex:
             remap[provisional[term]] = new_id
         term_ids = remap[term_ids]
 
+        if self.store_forward:
+            # Built here, not after the term-major sort below: this is the one
+            # point where (doc, term, tf) triples exist with final term ids but
+            # have not yet been reordered away from a form ForwardIndex.build()
+            # can re-sort doc-major itself. Costs one extra pass over the same
+            # triples the postings encoding below already uses.
+            from submission._forward import ForwardIndex
+            self.forward = ForwardIndex.build(docs_arr, term_ids, tfs_arr, self.N)
+
         # Group by term, ascending docid within each term. lexsort's LAST key is
         # primary, so this is "sort by term, then by doc".
         order = np.lexsort((docs_arr, term_ids))
@@ -480,6 +503,13 @@ class InvertedIndex:
         self._docid_off = np.zeros(n + 1, dtype=np.int64)
         self._term_start = np.zeros(n, dtype=np.int64)
         self._pos_off = np.zeros(n + 1, dtype=np.int64)
+        if self.store_forward:
+            # No postings at all (every document tokenised to nothing, or the
+            # corpus was empty), so every document trivially has zero terms.
+            from submission._forward import ForwardIndex
+            self.forward = ForwardIndex.build(
+                np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64),
+                np.zeros(0, dtype=np.int64), self.N)
 
     # ------------------------------------------------------------------
     # Query-time accessors
@@ -576,6 +606,7 @@ class InvertedIndex:
             "analysis": self.config.to_dict(),
             "store_positions": self.store_positions,
             "store_doc_ids": self.store_doc_ids,
+            "store_forward": self.store_forward,
             "n_tf_exceptions": int(self._tf_exc_idx.size),
         }
         with open(os.path.join(index_dir, _META), "w", encoding="utf-8") as f:
@@ -613,6 +644,9 @@ class InvertedIndex:
             self._write_blob(os.path.join(index_dir, _POS_LEN),
                              vbyte_encode(np.diff(self._pos_off)).tobytes())
             self._write_blob(os.path.join(index_dir, _POSITIONS), self._pos_buf.tobytes())
+
+        if self.store_forward and self.forward is not None:
+            self.forward.save(index_dir)
 
     @classmethod
     def load(cls, index_dir: str) -> "InvertedIndex":
@@ -666,4 +700,9 @@ class InvertedIndex:
             pos_len = read_vbyte(_POS_LEN, n_terms)
             index._pos_off = np.concatenate(([0], np.cumsum(pos_len))).astype(np.int64)
             index._pos_buf = read_raw(_POSITIONS)
+
+        index.store_forward = bool(meta.get("store_forward", False))
+        if index.store_forward:
+            from submission._forward import ForwardIndex
+            index.forward = ForwardIndex.load(index_dir)
         return index
