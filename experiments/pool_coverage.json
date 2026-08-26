@@ -1,0 +1,78 @@
+{
+  "shipped": {
+    "topics": 50,
+    "slots": 500,
+    "grade2": 286,
+    "grade1": 62,
+    "judged0": 117,
+    "unjudged": 35,
+    "unjudged_pct": 7.0,
+    "ndcg_scored": 0.6394701140592235,
+    "ndcg_optimistic": 0.6970609485368361,
+    "ndcg_condensed": 0.6567853966100503,
+    "per_topic_unjudged": [
+      [
+        5,
+        "32"
+      ],
+      [
+        4,
+        "4"
+      ],
+      [
+        3,
+        "50"
+      ],
+      [
+        3,
+        "12"
+      ],
+      [
+        3,
+        "1"
+      ]
+    ],
+    "build_s": 3.2342990830074996,
+    "index_mb": 23.957106,
+    "latency_ms": 0.6681899959221482,
+    "run_file": "runs/full_shipped.trec"
+  },
+  "rm3_stemmed": {
+    "topics": 50,
+    "slots": 500,
+    "grade2": 311,
+    "grade1": 74,
+    "judged0": 100,
+    "unjudged": 15,
+    "unjudged_pct": 3.0,
+    "ndcg_scored": 0.6845559914637346,
+    "ndcg_optimistic": 0.710833731007282,
+    "ndcg_condensed": 0.6919058216671118,
+    "per_topic_unjudged": [
+      [
+        3,
+        "47"
+      ],
+      [
+        3,
+        "15"
+      ],
+      [
+        2,
+        "32"
+      ],
+      [
+        2,
+        "1"
+      ],
+      [
+        1,
+        "50"
+      ]
+    ],
+    "build_s": 23.96804675005842,
+    "index_mb": 51.248211,
+    "latency_ms": 10.789105913136154,
+    "run_file": "runs/full_rm3_stemmed.trec"
+  }
+}
