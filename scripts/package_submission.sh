@@ -55,7 +55,8 @@ fi
 missing=0
 for f in assignment1.tex conftest.py data/README.md data/toy Dockerfile \
          docs/DOCKER_SUBMISSION.md docs/SUBMISSION_INTERFACE.md harness \
-         README.md requirements.txt runs scripts submission tests; do
+         README.md requirements.txt runs scripts submission tests \
+         submission/setup.py; do
   if [[ -e "$WORK/$REGNO/$f" ]]; then
     echo "  OK   $f"
   else
@@ -70,6 +71,35 @@ if find "$WORK/$REGNO" -type f -size +5M | grep -q .; then
   echo "ERROR: files over 5MB found in the archive:" >&2
   find "$WORK/$REGNO" -type f -size +5M -exec ls -lh {} \; >&2
   exit 1
+fi
+
+# Course staff are explicit: do not commit a precompiled .so, and do not
+# compile inside build_index(). The archive must ship sources only.
+if find "$WORK/$REGNO" -name '*.so' -o -name '*.pyd' | grep -q .; then
+  echo "ERROR: precompiled binaries found in the archive:" >&2
+  find "$WORK/$REGNO" \( -name '*.so' -o -name '*.pyd' \) >&2
+  exit 1
+fi
+echo "  OK   no precompiled binaries in the archive"
+
+# Build the extension the way the grading image does -- from inside submission/,
+# against submission/setup.py. Doing it here, on the EXTRACTED copy, is the only
+# way to prove the archive is self-sufficient: the working tree's .so files are
+# gitignored and therefore absent from the zip, so if this step fails, grading
+# would silently fall back to the slow pure-Python path.
+if [[ -f "$WORK/$REGNO/submission/setup.py" ]]; then
+  echo
+  echo "== building the compiled extension from the extracted copy =="
+  ( cd "$WORK/$REGNO/submission" && python setup.py build_ext --inplace >/dev/null 2>&1 ) \
+    && echo "  OK   extension built from the archive" \
+    || { echo "ERROR: submission/setup.py failed to build from the archive" >&2; exit 1; }
+  ( cd "$WORK/$REGNO" && python -c "
+from submission import bm25
+assert bm25.HAVE_FAST, 'extension built but not picked up by bm25'
+import submission.indexer as ix
+assert ix._FASTBUILD is not None, 'build kernel not picked up by indexer'
+print('  OK   both kernels import and are active')
+" ) || exit 1
 fi
 
 echo

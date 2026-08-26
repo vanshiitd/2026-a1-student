@@ -113,12 +113,14 @@ a C/C++ extension you compile yourself and call into. `Cython` is already
 in `requirements.txt` for this; `pybind11` works too if you add it
 yourself.
 
+- **Provide `submission/setup.py`.** If you use a compiled extension,
+  define it in this file. The provided Dockerfile, CI workflow, and course
+  staff's grading image detect the file and run
+  `python setup.py build_ext --inplace` from inside `submission/`.
 - **Build it at image-build time, not inside `build_index()`.** The
-  provided `Dockerfile` (and course staff's `Dockerfile.grading`, kept in
-  lockstep with it) includes a C/C++ toolchain (`build-essential`)
-  specifically so a `setup.py build_ext` / `pip install .` style build
-  runs during `docker build`, while network access is still available.
-  The grading container runs with `--network none` at scoring time, and
+  student and grading images include a C/C++ toolchain (`build-essential`)
+  and compile the extension while the image is built. The grading
+  container runs with `--network none` at scoring time, and
   anything that happens inside `build_index()` is charged against your
   index-build-time efficiency metric — a one-time compile isn't indexing
   work and shouldn't be billed as such.

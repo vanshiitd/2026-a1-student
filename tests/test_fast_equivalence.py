@@ -193,3 +193,76 @@ def test_cpp_builder_declines_configs_it_cannot_reproduce():
     assert not fb.Builder.supports(AnalysisConfig(stemmer="porter"))
     assert not fb.Builder.supports(AnalysisConfig(remove_stopwords=True))
     assert not fb.Builder.supports(AnalysisConfig(split_alphanum=True))
+
+
+# ---------------------------------------------------------------------------
+# Build-definition placement (course staff clarification, 26 Aug)
+# ---------------------------------------------------------------------------
+# Staff run `python setup.py build_ext --inplace` FROM INSIDE submission/, and
+# only if submission/setup.py exists. Getting this wrong fails silently: the
+# build is skipped or lands the .so in the wrong place, every import falls back
+# to pure Python, and the submission still passes its tests -- just slowly.
+# These tests pin the placement down so that cannot happen unnoticed.
+
+def test_setup_py_lives_in_submission_where_grading_looks_for_it():
+    import pathlib
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    assert (repo / "submission" / "setup.py").is_file(), (
+        "submission/setup.py is missing. Staff only build a compiled extension "
+        "if this exact path exists; without it the C kernels are never compiled.")
+    assert not (repo / "setup.py").exists(), (
+        "A stray root setup.py is no longer the build definition and will "
+        "mislead anyone running the build by hand.")
+
+
+def test_extension_module_names_are_bare_so_inplace_output_lands_correctly():
+    """Dotted names would nest the .so at submission/submission/_fast.so."""
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parent.parent
+           / "submission" / "setup.py").read_text()
+    assert '"submission._fast"' not in src and '"submission._fastbuild"' not in src, (
+        "Module names must be bare (_fast, not submission._fast): setup.py is "
+        "run with submission/ as the working directory, so a dotted name puts "
+        "the built .so one directory too deep and the import fails.")
+    assert 'sources=["_fast.pyx"]' in src and 'sources=["_fastbuild.pyx"]' in src, (
+        "Source paths must be relative to submission/, not the repo root.")
+
+
+def test_float_safety_flag_survives_the_move():
+    """-ffp-contract=off is what keeps the C kernel bit-identical to NumPy."""
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parent.parent
+           / "submission" / "setup.py").read_text()
+    assert '"-ffp-contract=off"' in src, (
+        "Without this flag the compiler fuses a*b+c into an FMA, which rounds "
+        "once instead of twice and diverges from NumPy on the full corpus.")
+    # Quoted form only: the file explains in a COMMENT why -ffast-math is
+    # excluded, and that prose must not trip the check.
+    assert '"-ffast-math"' not in src, "-ffast-math would break bit-identity."
+
+
+def test_no_precompiled_binaries_are_tracked_by_git():
+    """Staff are explicit: do not commit a precompiled .so."""
+    import subprocess, pathlib
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    out = subprocess.run(["git", "ls-files"], cwd=repo,
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        pytest.skip("not a git checkout")
+    tracked = out.stdout.split()
+    bad = [f for f in tracked if f.endswith((".so", ".pyd", ".dylib"))]
+    assert not bad, f"precompiled binaries are tracked: {bad}"
+
+
+def test_build_index_does_not_compile_anything():
+    """A one-time compile must not be billed to the index-build-time metric."""
+    import pathlib
+    subdir = pathlib.Path(__file__).resolve().parent.parent / "submission"
+    for py in subdir.glob("*.py"):
+        if py.name == "setup.py":
+            continue
+        src = py.read_text()
+        for forbidden in ("subprocess", "pyximport", "build_ext", "os.system"):
+            assert forbidden not in src, (
+                f"{py.name} references {forbidden!r}; compilation must happen at "
+                "image-build time, never inside build_index().")

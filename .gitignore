@@ -17,4 +17,7 @@ experiments/results.jsonl
 dist/
 build/
 *.so
+# Cython-generated sources. Regenerated from the .pyx at build time, so
+# committing them risks a stale copy being compiled instead of the real source.
 submission/_fast.c
+submission/_fastbuild.cpp

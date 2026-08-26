@@ -13,9 +13,10 @@ runs under, so "works on my machine" cannot cause a harness failure. It
 also includes a C/C++ toolchain (`build-essential`), so if you compile
 part of your submission as a Cython or pybind11 extension (see
 `docs/SUBMISSION_INTERFACE.md`, "Compiled extensions"), it builds
-correctly here too — course staff's grading image has the same toolchain,
-kept in lockstep with this one. Build and run it locally before you push,
-especially close to the conformance freeze:
+correctly here too. Put its build definition in `submission/setup.py`;
+the student image, CI, and course staff's grading image all run
+`python setup.py build_ext --inplace` from that directory. Build and run
+it locally before you push, especially close to the conformance freeze:
 
 ```bash
 docker build -t my-a1-submission .
@@ -48,7 +49,8 @@ not you use Docker. Course infrastructure builds a *separate* image from
 a *separate* Dockerfile that copies in course staff's own trusted copy of
 `harness/` and only your `submission/` directory — nothing else from your
 repo (including your own `Dockerfile`, `harness/`, or `tests/`) is part
-of the image that produces your score. The private held-out
+of the image that produces your score. If `submission/setup.py` exists,
+the grading image builds it in place before scoring. The private held-out
 corpus/queries/qrels are mounted read-only at grading time and are never
 baked into any image or committed anywhere you have access to; the
 grading container also runs with networking disabled.

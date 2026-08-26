@@ -38,7 +38,7 @@ Initial Submission & You will be given a dataset and topics to work with after \
 \cmidrule(lr){1-3}
 Competition Round & We will release the full leaderboard every day between the previous deadline day, and the final deadline date for this phase. The leaderboard is computed against a held out dataset and topics (will be revealed to you only after this deadline). You may submit your implementation as many times as you want during this phase. For each day, we will consider the latest version you have submitted by 5PM each day. & \textbf{29th August 2026, 5PM IST -- 3rd September 2026, 5PM IST} (please note the time) \\ 
 \cmidrule(lr){1-3}
-Report Submission & You are required to submit a report that explains your approach both in the initial submission phase as well as the competition round. You are also required to submit all the performance metrics (see the document below) you had in the released dataset and topics in each phase. &  \textbf{6th September 2026, 11:59PM IST} \\ 
+Report Submission & You are required to submit a report that explains your approach both in the initial submission phase as well as the competition round. You are also required to submit all the performance metrics (see the document below) you had in the released test dataset and topics in each phase. &  \textbf{6th September 2026, 11:59PM IST} \\ 
 \bottomrule
 \end{tabular}
 \end{center}
@@ -51,17 +51,16 @@ All submissions are to be made on Moodle.
 {\small
 \begin{enumerate}
 \item This programming assignment is to be done by each student individually. Do not collaborate by sharing code, algorithm, and any other pertinent details with each other. You are free to discuss and post questions to seek clarifications. Please post all discussions related to this assignment with "hw1" tag on Piazza. 
-\item All programs have to be written either using Python or C/C++ programming languages only. Anything else requires explicit prior permission from the instructor. The machine we use to evaluate your submissions has the following versions: \begin{itemize} \item {\textbf{C}, \textbf{C++}: gcc12.3;} \item {\textbf{Python: } version 3.12.} 
-\end{itemize} 
+\item All programs have to be written either using Python or C/C++ programming languages only. Anything else requires explicit prior permission from the instructor. The machine we use to evaluate your submissions is running a Ubuntu 24.04.3 LTS, with Python 3.12.3, 4 CPU cores, 8 GB RAM, GCC/G++ 13.3.0.  \\
 We recommend you to use same versions to avoid the use of deprecated/unsupported functions or take care to ensure required compatibility. 
-\item A single zip of the source code has to be submitted. The zip file should be structured such that, upon deflating all submission files should be under a directory with the student's registration number. E.g., if a student's registration number is \texttt{20XXYYYY999} then the zip submission should be named \textsf{20XXYYYY999.zip}. Upon deflating, \textbf{all contained files} should be under a directory named \textsf{./20XXYYYY999} only (names should be in uppercase). Your submission might be rejected and not be evaluated if you do not adhere to these specifications.
+\item A single zip of the source code has to be submitted. The zip file should be structured such that, upon deflating all submission files should be under a directory with the student's registration number. E.g., if a student's registration number is \texttt{20XXYYYY999} then the zip submission should be named \textsf{20XXYYYY999.zip}. Upon deflating, \textbf{all contained files} should be under a directory named \textsf{./20XXYYYY999} only (names should be in uppercase). Your submission might be rejected and not be evaluated if you do not adhere to these specifications. This requirement will be satisfied if you just download the ZIP file from your working repository fork, and rename it to appropriate Zip file name. 
 		
-	Apart from source files, the submission zip file should contain a build mechanism \textit{if needed} . It is the responsibility of each student to ensure that it compiles and generates the necessary executable as specified. \textbf{Please include an empty file in case building is not required} \textit{(e.g. if you are using Python)}. 	    \item Do not submit notebooks -- all programs will be run from the commandline only.
+%	Apart from source files, the submission zip file should contain a build mechanism \textit{if needed}. It is the responsibility of each student to ensure that it compiles and generates the necessary executable as specified. \textbf{Please include an empty file in case building is not required} \textit{(e.g. if you are using Python)}. 	    \item Do not submit notebooks -- all programs will be run from the commandline only.
 	
 	The  list of files to be submitted, along with their naming conventions and call signatures as given in the instructions below.
 
  \item \textbf{Note that we will use only Ubuntu Linux machines to build and run your assignments.} So take care that your file names, paths, argument handling etc. are compatible.
-\item You \emph{should not} submit data files. If you are planning to use any other ``special'' library, please talk to the instructor first (or post on Teams). 
+\item You \emph{should not} submit data files. If you are planning to use any other ``special'' library, please talk to the instructor first (or post on Piazza). 
 \item Note that your submission will be evaluated using larger collection. Only assumption you are allowed to make is that all documents will be in English, have sentences terminated by a period, \eat{each document is a separate file, }and all documents are in one single directory. The overall format of documents will be same as given in your training. The collection directory will be given as an input (see below).
 \item \textbf{Note that there will be no deadline extensions. Apart from the usual ``please start early'' advise, I must warn you that this assignment requires significant amount of implementation effort, as well as some `manual' tuning of parameters to get good speed up and performance. Do not wait till the end.}
 \end{enumerate}
@@ -70,6 +69,7 @@ The file structure in each submission must be exactly as follows (DO NOT RENAME 
 
  		\dirtree{%
  		.1 20XXYYYY999/.
+		.2 assignment1.tex.
  		.2 conftest.py.
 		.2 data/.
 		.3 README.md.
@@ -81,6 +81,7 @@ The file structure in each submission must be exactly as follows (DO NOT RENAME 
 		.2 harness/.
 		.2 README.md.
 		.2 requirements.txt.
+		.2 runs/
 		.2 scripts/.
 		.2 submission/.
 		.2 tests/.
@@ -105,6 +106,10 @@ The goal of this assignment is to build and tune a from-scratch inverted-index r
 
 \subsection{What you must implement}
 You must build the following components yourself — implemented from scratch, without using an existing search library (Lucene/Elasticsearch/Pyserini/Whoosh, etc.) for indexing or scoring — and exposed through the required Python entrypoint (Section \ref{subsec:entry}). You do not have to write pure Python: a C/C++ extension you compile yourself (via Cython or pybind11) and call from that entrypoint is fine, provided the indexing/scoring logic is your own; see the starter repo's `\texttt{docs/SUBMISSION\_INTERFACE.md}` ("Compiled extensions") for the build details and a timing caveat. You may use standard libraries for tokenisation/stemming (e.g., NLTK's Porter stemmer) and numerical libraries (NumPy).
+
+We have made a reference implementation along with the harness we will use in our evaluations at the following github repository: \url{https://github.com/col7364iitd/2026-a1-student.git}.
+\textbf{It is strongly recommended that you {\it fork} it into your own repository on github, and start working on your fork.} The advantage this is that you get for free a conformance check workflow that automatically runs smoke test on the submission so that your submission does not break any interface contracts. 
+
 \begin{description}
 	
 \item[Indexer:] builds an inverted index (postings lists with term frequencies and document/collection statistics needed for your scoring functions) over the provided corpus, and persists it to disk in a format your own code can reconstruct later without rebuilding from the raw corpus — the exact save/load contract is given in the starter repo. The on-disk size of what you persist is itself a graded leaderboard component (Section 7); a naive dump of every field you touched during indexing will cost you there, so decide deliberately what actually needs to survive to query time.
@@ -140,6 +145,7 @@ Every submission must run through the exact `\texttt{build\_index(corpus\_path, 
 \end{description}
 
 \section{Competition Mechanics and Scoring}
+\label{sec:scoring}
 \begin{description}
 \item[Format:] open leaderboard, unlimited submissions before the deadline, public dev-topic score visible in real time, private held-out-topic score revealed at the deadline (standard two-tier design to discourage dev-set overfitting).
 \begin{center}
@@ -166,7 +172,7 @@ Index size	& On-disk size of your persisted index after build, relative to class
 
 
 \section{Oral Defense}
-After the private leaderboard closes, a random selection of teams sit a 10–15 minute oral defense: a walkthrough of one design decision, 2–3 targeted questions on your own code, and a live perturbation (the examiner changes a parameter such as k1 or the smoothing constant and asks you to predict the effect before re-running). If the team cannot explain or meaningfully modify their own submission, the leaderboard-performance component below is capped at 50\% of its earned value regardless of rank.
+After the private leaderboard closes, a random selection of students sit a 10–15 minute oral defense: a walkthrough of one design decision, 2–3 targeted questions on your own code, and a live perturbation (the examiner changes a parameter such as k1 or the smoothing constant and asks you to predict the effect before re-running). If the team cannot explain or meaningfully modify their own submission, the leaderboard-performance component below is capped at 50\% of its earned value regardless of rank.
 
 \section{What is to be submitted?}
 \begin{enumerate}
@@ -184,7 +190,7 @@ After the private leaderboard closes, a random selection of teams sit a 10–15 
 \textbf{Component} &	Weight &	Criteria \\
 \hline
 \hline
-Leaderboard performance	& 50\%	& The Section 7 leaderboard score (nDCG@10 + MAP@10 + efficiency modifier + index-size score), scaled primarily by percentile rank among the whole class on the private held-out set; clearing the undisclosed baseline is a pass/fail floor, not a target to stop at. Capped at 50\% of earned value if the oral defense (below) indicates the team cannot explain their own submission.\\
+Leaderboard performance	& 50\%	& The Section ~\ref{sec:scoring} leaderboard score (nDCG@10 + MAP@10 + efficiency modifier + index-size score), scaled primarily by percentile rank among the whole class on the private held-out set; clearing the undisclosed baseline is a pass/fail floor, not a target to stop at. Capped at 50\% of earned value if the oral defense (below) indicates the team cannot explain their own submission.\\
 \hline
 Correctness of required components	& 20\%	& Boolean/VSM and BM25 retrievers are both correctly implemented and independently verifiable (graded by unit tests against known small examples, not leaderboard score alone). \\
 \hline

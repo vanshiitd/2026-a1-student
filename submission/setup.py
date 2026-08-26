@@ -1,5 +1,18 @@
 """
-setup.py — builds the optional C extension.
+submission/setup.py — builds the optional compiled extensions.
+
+Location and working directory are dictated by the grading harness: staff run
+
+    cd submission && python setup.py build_ext --inplace
+
+so every path here is relative to submission/, not the repo root.
+
+The module names are deliberately bare (`_fast`, not `submission._fast`).
+With `--inplace` run from inside this directory, a bare name puts the built
+`.so` alongside the `.pyx` -- i.e. at submission/_fast.…so, which is exactly
+where `from submission import _fast` looks for it. A dotted name here would
+nest the output at submission/submission/_fast.…so instead, and the import
+would fail while the build still "succeeded".
 
 The extension in submission/_fast.pyx fuses VByte decoding with BM25 scoring;
 profiling put 90% of query time in the phases it replaces. It is strictly an
@@ -11,7 +24,7 @@ Built at image-build time, never inside build_index() -- anything build_index()
 does is charged against the index-build-time efficiency metric, and a one-time
 compile is not indexing work.
 
-    python setup.py build_ext --inplace
+    cd submission && python setup.py build_ext --inplace
 """
 from setuptools import Extension, setup
 
@@ -24,16 +37,16 @@ import numpy as np
 
 extensions = [
     Extension(
-        "submission._fastbuild",
-        sources=["submission/_fastbuild.pyx"],
+        "_fastbuild",
+        sources=["_fastbuild.pyx"],
         include_dirs=[np.get_include()],
         language="c++",
         extra_compile_args=["-O3", "-std=c++11"],
         define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
     ),
     Extension(
-        "submission._fast",
-        sources=["submission/_fast.pyx"],
+        "_fast",
+        sources=["_fast.pyx"],
         include_dirs=[np.get_include()],
         # -O3 for speed, but two float-safety flags are mandatory:
         #   -ffast-math      would permit reassociation of float operations.

@@ -27,8 +27,11 @@ jobs:
         run: pip install -r requirements.txt
 
       # Built before the tests so the equivalence suite actually compares the C
-      # kernel against NumPy rather than skipping.
-      - name: Build the C extension
+      # kernel against NumPy rather than skipping. Runs from inside submission/,
+      # matching the grading image exactly.
+      - name: Build compiled extension
+        if: ${{ hashFiles('submission/setup.py') != '' }}
+        working-directory: submission
         run: python setup.py build_ext --inplace
 
       - name: Interface conformance tests
