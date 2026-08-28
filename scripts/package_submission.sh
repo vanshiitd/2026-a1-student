@@ -11,9 +11,25 @@
 # the raw sweep log -- cannot leak into the zip by accident. The assignment also
 # says not to submit data files.
 #
+# Scoped to exactly the required tree (assignment §3's dirtree) rather than
+# the whole tracked repo: `git archive HEAD` alone would also sweep in
+# experiments/ (our own dev-time probe scripts, ~20 files, not part of the
+# interface) and assignment1.pdf (starter-provided but not in the dirtree).
+# The spec's own wording -- "must be exactly as follows... might be rejected
+# and not be evaluated if you do not adhere" -- makes trimming to the literal
+# list the safer reading, and it costs nothing: nothing outside this list is
+# needed by build_index()/load_index()/retrieve(), and experiments/ stays
+# fully intact in the git history and on GitHub for anyone reviewing the repo.
+#
 # Usage:
 #     bash scripts/package_submission.sh 2024XXX0000
 set -euo pipefail
+
+# Single source of truth for both what gets archived and what gets verified
+# below, so the two guarantees ("only this" and "at least this") can't drift
+# apart from each other.
+REQUIRED_PATHS=(assignment1.tex conftest.py data Dockerfile docs harness
+                README.md requirements.txt runs scripts submission tests)
 
 REGNO="${1:-}"
 if [[ -z "$REGNO" ]]; then
@@ -39,7 +55,7 @@ fi
 
 mkdir -p "$OUT"
 ZIP="$OUT/$REGNO.zip"
-git archive --format=zip --prefix="$REGNO/" HEAD -o "$ZIP"
+git archive --format=zip --prefix="$REGNO/" -o "$ZIP" HEAD -- "${REQUIRED_PATHS[@]}"
 echo "built $ZIP"
 
 echo
@@ -53,9 +69,8 @@ if [[ "$top_level" != "$REGNO" ]]; then
 fi
 
 missing=0
-for f in assignment1.tex conftest.py data/README.md data/toy Dockerfile \
-         docs/DOCKER_SUBMISSION.md docs/SUBMISSION_INTERFACE.md harness \
-         README.md requirements.txt runs scripts submission tests \
+for f in "${REQUIRED_PATHS[@]}" data/README.md data/toy \
+         docs/DOCKER_SUBMISSION.md docs/SUBMISSION_INTERFACE.md \
          submission/setup.py; do
   if [[ -e "$WORK/$REGNO/$f" ]]; then
     echo "  OK   $f"
@@ -65,6 +80,24 @@ for f in assignment1.tex conftest.py data/README.md data/toy Dockerfile \
   fi
 done
 [[ "$missing" -eq 0 ]] || { echo "ERROR: required entries missing" >&2; exit 1; }
+
+# The other half of the guarantee REQUIRED_PATHS gives: nothing beyond that
+# list made it into the archive either. Catches the mirror-image mistake --
+# forgetting to add a new top-level path here after adding one to the repo.
+extra=0
+for f in "$WORK/$REGNO"/*; do
+  name="$(basename "$f")"
+  found=0
+  for req in "${REQUIRED_PATHS[@]}"; do
+    [[ "$name" == "$req" ]] && found=1 && break
+  done
+  if [[ "$found" -eq 0 ]]; then
+    echo "  EXTRA $name (not in REQUIRED_PATHS -- not part of assignment §3's tree)" >&2
+    extra=1
+  fi
+done
+[[ "$extra" -eq 0 ]] || { echo "ERROR: unexpected top-level entries in the archive" >&2; exit 1; }
+echo "  OK   no top-level entries beyond the required tree"
 
 # Nothing large should have slipped in. The corpus alone is ~190MB.
 if find "$WORK/$REGNO" -type f -size +5M | grep -q .; then
