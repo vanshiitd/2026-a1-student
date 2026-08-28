@@ -17,6 +17,13 @@ experiments/results.jsonl
 dist/
 build/
 *.so
+# Every scratch index directory this project has built during ad-hoc
+# experimentation (query.py, pool-coverage, cross-collection, fusion probes)
+# is dot-prefixed and disposable -- regenerated from the corpus on demand.
+# One (22MB) accidentally reached a commit via a broad `git add -A` once (see
+# notes/findings.md F43); this blanket rule is the fix, not a case-by-case list.
+.*_index*/
+.query_offsets-*.json
 # Cython-generated sources. Regenerated from the .pyx at build time, so
 # committing them risks a stale copy being compiled instead of the real source.
 submission/_fast.c

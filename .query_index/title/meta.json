@@ -1,1 +1,0 @@
-{"format_version": 3, "n_docs": 171332, "n_terms": 55075, "total_tokens": 1651621, "avg_doc_len": 9.63988630261714, "analysis": {"lowercase": true, "remove_stopwords": false, "stemmer": null, "min_token_len": 1, "max_token_len": 32, "split_alphanum": false}, "store_positions": false, "store_doc_ids": false, "store_forward": false, "n_tf_exceptions": 0}
