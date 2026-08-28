@@ -71,9 +71,10 @@ _POSITIONS = "positions.bin"
 def tokenize(text: str) -> List[str]:
     """Lowercase, alphanumeric-only tokenization.
 
-    Kept as a module-level function with the shipped name and behaviour. The
-    configurable chain used by the index itself lives in submission/_analysis.py;
-    this delegates to it with default settings so the two can never drift.
+    Kept as a module-level function under this name for interface
+    compatibility. The configurable chain used by the index itself lives in
+    submission/_analysis.py; this delegates to it with default settings so
+    the two can never drift.
     """
     from submission._analysis import analyze
     return analyze(text)
@@ -101,7 +102,7 @@ class InvertedIndex:
         self.store_positions = store_positions
         # A forward (doc -> terms) index, needed only by pseudo-relevance
         # feedback (submission/rm3.py). Off by default: it is real extra disk
-        # and build time, and the shipped configuration never needs it.
+        # and build time, and the plain BM25 strategy never needs it.
         self.store_forward = False
         self.forward = None  # submission._forward.ForwardIndex, once built/loaded
         self._prefix_tokens = -1

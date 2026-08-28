@@ -1,18 +1,19 @@
 """
-tests/test_rm3_strategy.py — the rm3_stemmed competition strategy, and the
-switch that selects between it and the shipped default.
+tests/test_rm3_strategy.py — the rm3_stemmed strategy, and the switch that
+selects between it and the plain BM25 ("shipped") alternative.
 
-submission/retrieve.py's ACTIVE_STRATEGY is a one-line edit intended for a
-competition-round probe day (see its module-level comment). The risk that
-creates: a future change to submission/rm3.py or submission/_forward.py could
-silently break the non-default strategy, and nothing would notice until
-someone actually flips the switch on a live probe day, under time pressure,
-with the private held-out topics on the line.
+submission/retrieve.py's ACTIVE_STRATEGY is a one-line edit (see its
+module-level comment) -- currently rm3_stemmed, shipped for the 28 Aug
+initial submission; plain BM25 remains available as a same-topics comparison
+point for the competition round. The risk either way: a future change to
+submission/rm3.py or submission/_forward.py could silently break the
+non-active strategy, and nothing would notice until someone actually flips
+the switch, under time pressure, with the private held-out topics on the line.
 
 These tests exercise the rm3_stemmed path continuously regardless of which
-strategy is currently committed, and pin down that the committed default is
-the dev-validated one -- not the higher-variance probe candidate -- so an
-accidental edit to that one line fails CI rather than shipping silently.
+strategy is currently committed, and pin down that ACTIVE_STRATEGY matches
+what was actually intended to ship, so an accidental edit to that one line
+fails CI rather than shipping silently.
 
 Cross-process persistence itself (build_index and load_index/retrieve running
 as genuinely separate processes) is already covered generally by

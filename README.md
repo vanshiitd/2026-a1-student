@@ -4,18 +4,35 @@ An inverted-index retrieval engine built from scratch (no Lucene/Elasticsearch/
 Pyserini/Whoosh/`rank_bm25`), exposed through the three entrypoints the grading
 harness calls.
 
-**Final entry: BM25 with `k1 = 4.5`, `b = 0.60`** over a plain lowercase
-alphanumeric analysis chain.
+Two ranking strategies are fully implemented; `submission/retrieve.py`'s
+`ACTIVE_STRATEGY` constant selects which one ships. Both are dev-validated and
+independently tested regardless of which is active — switching is a one-line
+change, not a redeploy.
+
+**Currently shipped: `"rm3_stemmed"`** — BM25 with pseudo-relevance feedback
+(RM3) over a stemmed analysis chain plus a stemmed pseudo-title field. Full
+methodology, the parameter search, and every technique tried and rejected
+along the way are in the accompanying report, submitted separately.
 
 | | dev set (50 topics, 171,332 docs) |
 |---|---|
-| nDCG@10 | **0.6281** |
-| MAP@10 | 0.0141 *(ceiling on this collection is 0.0267 — see report §2)* |
-| MRR / P@10 | 0.8804 / 0.6900 |
-| Index size | **40.8 MB** |
-| Index build | 10.7 s |
-| Index load | 0.03 s |
-| Query latency | 9.7 ms mean |
+| nDCG@10 | **0.6846** |
+| MAP@10 | 0.0172 *(ceiling on this collection is ~0.027 — see the report)* |
+| MRR / P@10 | 0.8583 / 0.7700 |
+| Index size | **48.9 MB** |
+| Index build | 25.7 s |
+| Index load | 0.53 s |
+| Query latency | 19.4 ms mean |
+
+The alternative, `"shipped"` (plain BM25, `k1=4.5, b=0.60`, plus an unstemmed
+pseudo-title field — no feedback pass), is smaller, ~30x faster to build and
+~30x lower query latency, and scores 0.6395 nDCG@10 on the same dev topics.
+RM3's dev-set advantage is real but has never crossed the p<0.05 significance
+bar this project holds every other change to (best honest estimate: p≈0.05–0.08
+across four independent tests) and has an unexplained asymmetric failure mode
+on a handful of topics. The report covers the full evidence trail behind
+shipping the higher-variance option anyway, and the held-out A/B plan
+resolving it during the competition round.
 
 ---
 
@@ -51,7 +68,7 @@ python -m harness.run_harness \
   --corpus data/full/corpus.jsonl \
   --queries data/full/queries_dev.tsv \
   --qrels data/full/qrels_dev.txt \
-  --run-out runs/full_bm25_tuned.trec --report-out runs/full_bm25_tuned.json
+  --run-out runs/full_run.trec --report-out runs/full_report.json
 ```
 
 Both builds are **deterministic** — the same corpus produces byte-identical
@@ -62,16 +79,20 @@ index files, and the same query returns an identical ranking every time
 
 | File | Role |
 |---|---|
-| `retrieve.py` | The three required entrypoints. Deliberately thin; holds the tuned `k1`/`b` as named constants. |
-| `indexer.py` | Columnar inverted index, delta+VByte postings, `save()`/`load()`. Optional term positions. |
+| `retrieve.py` | The three required entrypoints. Deliberately thin; holds `ACTIVE_STRATEGY` and both strategies' tuned constants. |
+| `indexer.py` | Columnar inverted index, delta+VByte postings, `save()`/`load()`. Optional term positions and forward (doc→terms) index. |
 | `_analysis.py` | The single tokenisation/stopword/stemming chain, shared by indexing and querying. |
 | `_codecs.py` | Delta and VByte integer codecs (vectorised). |
+| `_forward.py` | Doc→terms index, built only when RM3 needs it. |
 | `_scorers.py` | Scorer registry: BM25, BM25+, LM-Dirichlet, PL2, DPH. |
-| `_traverse.py` | One postings traversal feeding every scorer; RRF fusion helper. |
+| `_traverse.py` | One postings traversal feeding every scorer. |
 | `_proximity.py` | Ordered/unordered window counting for term dependence. |
-| `bm25.py` | The required BM25 entrypoint (tunable `k1`, `b`). |
+| `bm25.py` | The required BM25 entrypoint (tunable `k1`, `b`), plus pseudo-title field scoring. |
 | `boolean_vsm.py` | The required Boolean AND/OR and TF-IDF cosine VSM. |
-| `custom_scorer.py` | Sequential Dependence Model over the above. |
+| `custom_scorer.py` | Sequential Dependence Model over the above (dev-tested, not shipped — see the report). |
+| `rm3.py` | Pseudo-relevance feedback (RM3) over the stemmed body + title. Active when `ACTIVE_STRATEGY = "rm3_stemmed"`. |
+| `setup.py` | Build definition for the optional compiled extensions below. Run from inside `submission/`: `python setup.py build_ext --inplace`. |
+| `_fast.pyx`, `_fastbuild.pyx` | Optional C/C++ extensions (Cython) — fused VByte-decode+BM25 scoring and a C++ tokeniser/builder. Both are pure speed: every caller falls back to an equivalent pure-Python/NumPy path if the extension didn't compile, and `tests/test_fast_equivalence.py` asserts the two paths produce bit-identical results. |
 
 ### Design notes
 
@@ -79,35 +100,50 @@ index files, and the same query returns an identical ranking every time
 object per posting; at 16.3M postings that is several GB of interpreter overhead
 and would not fit the 8 GB grading machine. Every quantity is a flat NumPy array.
 
-**Postings are delta + VByte encoded.** Document ids within a postings list are
-sorted and dense, so their gaps are small integers — a 4-byte int32 spends 4
-bytes on a gap of 3, VByte spends 1. The *whole collection* is encoded in a
-single vectorised call rather than once per term. Result: 40.8 MB against an
-estimated ~279 MB for a naive JSON dump of the same data.
+**Postings are delta + VByte encoded**, plus nibble-packed term frequencies and
+zlib compression on disk. Document ids within a postings list are sorted and
+dense, so their gaps are small integers — a 4-byte int32 spends 4 bytes on a
+gap of 3, VByte spends 1. The *whole collection* is encoded in a single
+vectorised call rather than once per term.
 
-**Raw document text is deliberately not persisted.** BM25 and VSM need only
-term-frequency and length statistics; storing 189 MB of text would cost the
+**Raw document text is deliberately not persisted.** Every scorer needs only
+term-frequency and length statistics; storing the raw corpus would cost the
 index-size component for no query-time benefit.
 
 **One traversal, N scorers.** A scorer is a pure function of per-posting
 statistics, so running several rankers costs barely more than running one.
 
+**Pseudo-title field.** Titles run directly into abstracts with no delimiter,
+so the boundary isn't recoverable — but "early terms are more indicative"
+doesn't need an exact one. The first 10 tokens of each document are indexed as
+a second field and added at a small weight, both to plain BM25 and to RM3's
+scoring.
+
 ## Tests
 
 ```bash
-pytest tests/ -v          # 74 tests
+pytest tests/ -v          # 169 tests
 ```
 
 - `test_interface_conformance.py`, `test_metrics.py` — shipped with the starter.
 - `test_codecs.py` — codec round-trips, including the exact VByte width
   boundaries where an off-by-one would hide.
 - `test_ranking_components.py` — BM25 and VSM against **hand-derived** expected
-  values (computed in the comments from the formulas, never by pasting what the
-  implementation returned), plus determinism, save/load stability, and edge cases.
+  values, plus determinism, save/load stability, and edge cases.
+- `test_fast_equivalence.py` — the C extensions must be bit-identical to the
+  pure-Python paths, and the submission must still run correctly if they never
+  compiled at all. Also guards `submission/setup.py`'s location and the
+  float-safety compile flags.
+- `test_forward_index.py`, `test_rm3_strategy.py` — the forward index and the
+  RM3 strategy, including a guard that `ACTIVE_STRATEGY` matches what was
+  actually intended to ship (update it alongside any deliberate switch).
 
 ## `experiments/` — tuning and analysis
 
-Not part of the submission's runtime; nothing under `submission/` imports it.
+Not part of the submission's runtime, and not part of the submission archive
+either (`scripts/package_submission.sh` scopes the zip to exactly the
+assignment's required file tree). Lives in this repository for anyone
+reviewing the methodology; nothing under `submission/` imports it.
 
 ```bash
 python experiments/profile_corpus.py      # collection statistics
@@ -123,9 +159,10 @@ python experiments/report_assets.py       # report tables and figures
 
 ## Reading
 
-`plan.md` holds the strategy and `notes/findings.md` the measurement log —
-21 numbered findings, including the techniques that were implemented, measured,
-and then **rejected on the evidence** (analysis-chain tuning, RRF and score-based
-fusion, SDM/proximity, RM3 feedback, PL2/DPH). Their negative results, and the
-gap between in-sample and cross-validated gains that produced them, are the
-substance of the report.
+The accompanying report covers the strategy and the full measurement log —
+every technique that was implemented, measured, and then **rejected on the
+evidence** (analysis-chain tuning, fusion in several forms, SDM/proximity,
+filtered RM3 feedback vocabularies, PL2/DPH). The gap between in-sample and
+cross-validated gains that produced most of those rejections, and the
+reasoning behind shipping RM3 despite it not clearing the project's own
+significance bar, are the substance of it.
