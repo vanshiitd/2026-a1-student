@@ -1,36 +1,16 @@
 """
-submission/bm25.py — Okapi BM25 ranking.
-
-Required component (assignment Section 4.1): "a BM25 implementation with
-tunable k1 and b." See the assignment background (Section 3) for the
-Robertson & Walker / Robertson & Zaragoza references this is based on.
-
-BM25 score for a query Q = q1...qn against document D:
+submission/bm25.py — Okapi BM25 ranking (assignment Section 4.1, tunable k1/b).
 
     score(D, Q) = sum_i  IDF(qi) * ( tf(qi, D) * (k1 + 1) )
                                    / ( tf(qi, D) + k1 * (1 - b + b * |D| / avgdl) )
+    IDF(qi)     = ln( (N - df(qi) + 0.5) / (df(qi) + 0.5) + 1 )
 
-A standard IDF variant (Robertson-Sparck Jones, +1-smoothed so it stays
-non-negative even for terms occurring in more than half the corpus):
+k1 controls tf saturation, b controls length normalisation strength -- both
+real parameters, not captured constants, since the assignment sweeps them and
+the oral defense perturbs exactly these.
 
-    IDF(qi) = ln( (N - df(qi) + 0.5) / (df(qi) + 0.5) + 1 )
-
-where:
-    N        = number of documents in the corpus
-    df(qi)   = number of documents containing qi
-    tf(qi,D) = term frequency of qi in D
-    |D|      = length of D in tokens
-    avgdl    = average document length across the corpus
-
-k1 (typically 1.2-2.0) controls term-frequency saturation; b (in [0, 1])
-controls document-length normalisation strength. Both are exposed as real
-parameters -- never captured constants -- because the assignment requires
-sweeping them (Section 8, "parameter search procedure for k1, b") and the oral
-defense perturbs exactly these.
-
-The arithmetic itself lives in submission/_scorers.py (`bm25_contribution`) so
-that one postings traversal can feed several rankers; this module is the
-assignment-facing entrypoint for it.
+Arithmetic lives in submission/_scorers.py so one postings traversal can feed
+several rankers; this is the assignment-facing entrypoint for it.
 """
 from typing import List, Optional, Tuple
 
@@ -42,14 +22,10 @@ from submission._codecs import unpack_tf_nibbles, vbyte_decode
 from submission._scorers import robertson_idf
 from submission.indexer import InvertedIndex
 
-# Optional C extension (submission/_fast.pyx), built at image-build time by
-# setup.py. It fuses VByte decoding with BM25 scoring into a single pass;
-# profiling put ~90% of query time in the phases it replaces.
-#
-# Imported behind try/except on purpose: if it was not compiled for any reason,
-# scoring silently falls back to the pure-NumPy path below and the submission
-# still runs correctly, just slower. Speed is never allowed to become a
-# correctness dependency.
+# Optional C extension (submission/_fast.pyx): fuses VByte decoding with BM25
+# scoring, ~90% of query time in the phases it replaces. Imported behind
+# try/except -- if it didn't compile, scoring falls back to pure NumPy below
+# and the submission still runs correctly, just slower.
 try:
     from submission import _fast
     HAVE_FAST = True
@@ -88,10 +64,8 @@ def build(index: InvertedIndex, title_index: Optional[InvertedIndex] = None,
     _EXPANDED = {}
     _NORM_CACHE = {}
     if HAVE_FAST and index.N:
-        # Warm both caches HERE, not lazily on the first query. build() is
-        # called from retrieve.load_index(), whose time is not scored, whereas
-        # per-query latency is -- doing this lazily charged the ~0.4s expansion
-        # to query one and took mean latency from 0.76ms to 8.70ms.
+        # Warmed here, not lazily on first query: doing it lazily charged the
+        # ~0.4s expansion to query one, taking mean latency 0.76ms -> 8.70ms.
         _expanded(index)
         _length_norm(index, BM25_DEFAULT_K1, BM25_DEFAULT_B)
         if title_index is not None and title_index.N:
@@ -183,11 +157,9 @@ def _score_fast(index, query: str, k: int, k1: float, b: float) -> List[Tuple[st
     """
     if k <= 0:
         return []
-    # Insertion order, NOT set order. Float addition is not associative, so
-    # accumulating a document's per-term contributions in a different sequence
-    # yields a different float64 result -- a 2-ULP divergence that the
-    # equivalence test caught. _traverse uses Counter(...).items(), which is
-    # insertion-ordered, so this must match it exactly.
+    # Insertion order, not set order: float addition isn't associative, and
+    # _traverse's Counter(...).items() is insertion-ordered, so this must
+    # match it exactly to stay bit-identical (a 2-ULP divergence caught this).
     terms = list(dict.fromkeys(analyze(query, index.config)))
     if not terms:
         return []
@@ -195,11 +167,9 @@ def _score_fast(index, query: str, k: int, k1: float, b: float) -> List[Tuple[st
     scores = np.zeros(index.N, dtype=np.float64)
     touched = np.zeros(index.N, dtype=np.uint8)
     hit = _accumulate(index, terms, scores, touched, k1, b, 1.0)
-    # Pseudo-title field: the first N tokens of each document, scored as a
-    # separate BM25 field and added with a small weight. Documents here are a
-    # title concatenated onto an abstract with no delimiter, so the boundary
-    # cannot be recovered exactly -- but the signal (terms appearing early are
-    # more indicative) does not need an exact boundary.
+    # Pseudo-title field: first N tokens of each document, scored separately
+    # and added with a small weight. No recoverable title/abstract boundary,
+    # but "early terms are more indicative" doesn't need an exact one.
     if _TITLE is not None and _TITLE_WEIGHT and _TITLE.N == index.N:
         hit = _accumulate(_TITLE, terms, scores, touched, k1, b, _TITLE_WEIGHT) or hit
 

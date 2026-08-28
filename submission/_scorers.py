@@ -1,32 +1,20 @@
 """
-submission/_scorers.py — the scorer registry (plan.md Section 4.4).
+submission/_scorers.py — the scorer registry.
 
-Every ranking function in this submission is expressed as a pure, vectorised
-contribution over one query term's postings list. That buys three things:
-
-  1. One postings traversal serves N scorers (see submission/_traverse.py), so
-     fusing several rankers costs barely more than running one.
-  2. Adding a scorer is ~20 lines, which is what makes plan.md Section 5.0's
-     "fuse, don't select" strategy affordable at all.
-  3. Each scorer is independently unit-testable against a hand-computed example
-     (assignment Section 7: "graded by unit tests against known small examples").
-
-Interface
----------
-A scorer supplies:
+Every ranking function is a pure, vectorised contribution over one query
+term's postings list, so one postings traversal serves N scorers and each is
+independently unit-testable against a hand-computed example.
 
     term_contribution(tfs, doc_lens, df, cf, query_tf, stats, **params) -> ndarray
         Score contribution of ONE query term to each document in its postings
-        list. `tfs` and `doc_lens` are parallel arrays over that postings list.
+        list. tfs/doc_lens are parallel arrays over that list.
 
     doc_prior(doc_lens, query_len, stats, **params) -> ndarray | None
-        Optional per-document term-independent term, applied once to candidate
-        documents. Language models need this (the smoothing normaliser); BM25
-        does not and returns None.
+        Optional per-document term-independent term (language models need
+        this for the smoothing normaliser; BM25 returns None).
 
-Parameters are always explicit keyword arguments with defaults declared in the
-registry -- never constants captured in the function body. The assignment
-requires k1/b to be tunable, and the oral defense perturbs exactly these.
+Parameters are always explicit keyword args with registry defaults, never
+constants captured in the function body -- k1/b must be tunable.
 """
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
@@ -157,17 +145,11 @@ def _lm_dirichlet_prior(doc_lens, query_len, stats: CollectionStats, mu=1500.0):
 
 
 # ---------------------------------------------------------------------------
-# Divergence From Randomness (Amati & van Rijsbergen 2002)
-#
-# DFR scores a term by how far its distribution in a document diverges from
-# what a random process would produce. The family is worth having because it
-# reaches the same goal by an entirely different route from BM25's heuristic
-# saturation, which makes it a natural decorrelated partner rather than another
-# BM25 variant.
-#
-# Both models below follow Terrier's reference implementations (PL2.java,
-# DPH.java). PROVENANCE: transcribed from those formulations rather than derived
-# here, and listed as such in the report's code-provenance statement.
+# Divergence From Randomness (Amati & van Rijsbergen 2002). Scores a term by
+# how far its distribution diverges from a random process, an entirely
+# different route from BM25's saturation heuristic. Both below follow
+# Terrier's reference implementations (PL2.java, DPH.java) -- transcribed
+# rather than derived, and listed as such in the report's provenance statement.
 # ---------------------------------------------------------------------------
 
 _LOG2_E = float(np.log2(np.e))

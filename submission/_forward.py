@@ -2,22 +2,12 @@
 submission/_forward.py — a forward (doc -> terms) index, for pseudo-relevance
 feedback (submission/rm3.py).
 
-RM3 needs the full term vector of each feedback document -- an inverted index
-alone cannot answer "what terms does document d contain" without scanning
-every postings list. This is that missing direction, encoded with exactly the
-same primitives as the inverted index (delta+VByte doc/term ids, nibble-packed
-term frequencies, see submission/_codecs.py) so it costs nothing new to
-understand and round-trips through the same property-tested codecs.
+An inverted index alone can't answer "what terms does document d contain"
+without scanning every postings list; this is that missing direction, using
+the same delta+VByte / nibble-packed primitives as _codecs.py.
 
-Term ids here are the SAME ids as the InvertedIndex it is built alongside --
-a `ForwardIndex` is only ever useful paired with the `InvertedIndex` that
-assigned those ids, and is built from that index's own postings (see
-`InvertedIndex.build_forward()`), never from raw text directly.
-
-Deliberately not built by default: it exists only for the optional RM3 scorer
-and is skipped entirely for the shipped configuration, so it costs nothing --
-in build time, index size, or code paths exercised -- for a run that does not
-request it.
+Term ids here are the same ids as the InvertedIndex it's built alongside, and
+only ever useful paired with it. Not built by default -- only RM3 needs it.
 """
 import os
 from typing import Tuple

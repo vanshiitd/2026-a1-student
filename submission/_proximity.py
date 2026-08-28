@@ -1,27 +1,16 @@
 """
-submission/_proximity.py — ordered and unordered window counting.
+submission/_proximity.py — ordered and unordered window counting for SDM
+(Metzler & Croft 2005): how often two adjacent query terms occur next to
+each other (ordered) or near each other (unordered) in a document.
 
-Supplies the term-dependence evidence the Sequential Dependence Model needs
-(Metzler & Croft 2005): for each adjacent query-term pair, how often the two
-terms occur next to each other (ordered) or near each other (unordered) in a
-document.
+Vectorised by folding positions into one global key,
+`key = doc_id * _DOC_STRIDE + position`, with _DOC_STRIDE larger than any
+document length. Keys from different documents then can't fall within a
+window of each other, so two `searchsorted` calls over flat arrays replace a
+per-document Python merge loop.
 
-The whole computation is vectorised through one trick: positions are folded into
-a single global key
-
-    key = doc_id * _DOC_STRIDE + position
-
-with `_DOC_STRIDE` larger than any document length in the collection. Because the
-stride exceeds every position, keys from different documents can never fall
-within a window of each other, so a window query over the flat key array is
-automatically confined to within-document matches. That turns "for each shared
-document, merge two position lists" -- a Python loop over documents -- into two
-`searchsorted` calls over flat arrays.
-
-Counting is restricted to a candidate set (the top-N of the unigram pass) rather
-than the whole collection. Proximity is a reranking signal: a document with no
-query terms at all cannot be rescued by term dependence, so there is nothing to
-gain from scoring beyond the candidates, and a great deal of time to lose.
+Restricted to the unigram pass's top-N candidates -- proximity reranks, it
+can't rescue a document with no query terms at all.
 """
 from typing import Dict, Optional, Tuple
 

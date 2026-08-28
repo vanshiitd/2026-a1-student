@@ -1,29 +1,16 @@
 """
 submission/_codecs.py — integer compression primitives for the postings file.
 
-Implements delta (gap) encoding and byte-aligned variable-length integers
-(VByte / LEB128-style): the standard way to store an inverted index compactly,
-and the basis of the index-size leaderboard component (assignment Section 7,
-plan.md Section 6).
+Delta (gap) encoding plus byte-aligned variable-length integers (VByte):
+document ids within a postings list are sorted and dense, so their gaps are
+small. A 4-byte int32 spends 4 bytes on a gap of 3; VByte spends 1.
 
-Why VByte and not "just pickle the arrays": document ids within a postings list
-are sorted and dense, so their *gaps* are small integers. A 4-byte int32 spends
-4 bytes on a gap of 3. VByte spends 1. On a real collection this is the
-difference between a multi-hundred-megabyte index and a small one, and it costs
-one cheap decode pass.
+Format (little-endian 7-bit groups): low 7 bits carry payload, high bit
+(0x80) set means "more bytes follow" -- so 0..127 is one byte, 128..16383 two.
 
-Format (one byte at a time, little-endian 7-bit groups):
-    - low 7 bits of each byte carry payload
-    - high bit (0x80) set => "more bytes follow"
-    - so 0..127 is one byte, 128..16383 is two, etc.
-
-Everything here is vectorised with NumPy rather than written as a Python loop.
-That is not premature optimisation: indexing touches every posting in the
-collection, and `build_index()` wall-clock time is a graded efficiency metric
-(assignment Section 7). A per-posting Python loop would dominate build time.
-
-All functions are pure and round-trip exact for non-negative integers; see
-tests/test_codecs.py for the property tests that pin that down.
+Vectorised with NumPy throughout rather than a Python loop, since indexing
+touches every posting and build time is graded. Pure, round-trip exact for
+non-negative integers; see tests/test_codecs.py.
 """
 from typing import Sequence
 

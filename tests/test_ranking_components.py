@@ -382,18 +382,46 @@ def test_retrieve_still_raises_before_load_index():
         entry._INDEX = saved
 
 
+def _build_active_strategy_state(entry):
+    """Set up module state for whichever ACTIVE_STRATEGY is current, mirroring
+    what retrieve.load_index() does. Needed because the `index` fixture only
+    builds a plain body for bm25 -- rm3 needs a forward index + title too."""
+    if entry.ACTIVE_STRATEGY == "rm3_stemmed":
+        from submission._analysis import AnalysisConfig
+        cfg = AnalysisConfig(stemmer="porter")
+        body = InvertedIndex(cfg)
+        body.store_forward = True
+        body.build(CORPUS)
+        title = InvertedIndex(cfg)
+        title.store_doc_ids = False
+        title.build([(d, t.split(" ", 1)[0]) for d, t in CORPUS])
+        entry._INDEX = body
+        entry.rm3.build(body, title)
+    else:
+        ix = InvertedIndex()
+        ix.build(CORPUS)
+        entry._INDEX = ix
+        bm25.build(ix)
+    return entry._INDEX
+
+
 def test_retrieve_guard_degrades_one_query_not_the_run(index, monkeypatch, capsys):
-    """A scorer blowing up must cost one query, not the whole submission."""
+    """A scorer blowing up must cost one query, not the whole submission.
+
+    Patches whichever scorer ACTIVE_STRATEGY actually routes to, so this
+    stays correct regardless of which strategy is currently shipped.
+    """
     from submission import retrieve as entry
     entry._INDEX = index
+    active_mod = entry.rm3 if entry.ACTIVE_STRATEGY == "rm3_stemmed" else entry.bm25
 
     def boom(*_a, **_kw):
         raise ValueError("simulated scorer failure")
 
-    monkeypatch.setattr(entry.bm25, "score", boom)
+    monkeypatch.setattr(active_mod, "score", boom)
     assert entry.retrieve("a b c", 10) == []
     assert "simulated scorer failure" in capsys.readouterr().err
 
     monkeypatch.undo()
-    bm25.build(index)
+    _build_active_strategy_state(entry)
     assert entry.retrieve("a b c", 10), "must recover once the fault clears"

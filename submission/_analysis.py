@@ -1,20 +1,13 @@
 """
 submission/_analysis.py — the single text-analysis chain.
 
-Every token that enters the index and every token that leaves a query MUST pass
-through `analyze()`. That is the whole point of this module existing: an index
-built with one tokenizer and queried with another silently loses recall in a way
-that looks like a bad scorer rather than a bug.
+Every token entering the index and every token leaving a query passes through
+`analyze()`. An index built with one tokenizer and queried with another
+silently loses recall in a way that looks like a bad scorer, not a bug.
 
-The chain is deliberately config-driven rather than hardcoded. plan.md L1 sweeps
-these choices (stemming, stopwords, number handling) and the winning
-configuration is frozen on 24 Aug; until then the defaults are the plain
-lowercase-alphanumeric behaviour the starter shipped with, so day-1 numbers are
-comparable to the starter baseline.
-
-The active config is persisted into the index (`meta.json`) and restored at load
-time, so a query can never be analysed differently from the corpus it is being
-run against -- even if the defaults here change between build and load.
+Config-driven rather than hardcoded, and persisted into the index's
+meta.json so a query can never be analysed differently from the corpus it's
+run against, even if the module's defaults change between build and load.
 """
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional

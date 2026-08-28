@@ -1,34 +1,18 @@
 """
-submission/boolean_vsm.py — Boolean retrieval + vector-space ranking.
+submission/boolean_vsm.py — Boolean retrieval + vector-space ranking
+(assignment Section 4.1).
 
-Required component (assignment Section 4.1): "supports conjunctive/
-disjunctive Boolean queries and a cosine-similarity vector-space ranking
-with a TF-IDF weighting scheme of your choice."
+1. Boolean: AND/OR combination of query terms, set membership only, no
+   ranking.
+2. VSM: TF-IDF weighted cosine similarity --
 
-Two independent pieces:
-
-1. Boolean retrieval: treat the query as an AND (conjunctive) or OR
-   (disjunctive) combination of its terms and return the matching document set
-   -- no ranking, just set membership.
-
-2. Vector-space ranking: represent query and documents as TF-IDF weighted
-   vectors and rank by cosine similarity. The weighting used here is the
-   textbook one from the assignment docstring:
-
-       w(t, d) = tf(t, d) * log( N / df(t) )
-
-   with natural log, applied to both the document and the query side, and
-
+       w(t, d)   = tf(t, d) * log( N / df(t) )
        sim(q, d) = (q . d) / (||q|| * ||d||)
 
-Both read the same InvertedIndex built in indexer.py.
-
-Implementation note on ||d||: the document norm needs every term in a document,
-not just the query terms, so it cannot be derived from a query-time traversal.
-It is computed in one vectorised pass over the whole postings file and then
-cached -- see `_document_norms()`. That pass is deferred until the first
-`vsm_score()` call rather than run in `build()`, so a harness run that only uses
-BM25 never pays for it (index load time is a measured efficiency metric).
+Both read the same InvertedIndex from indexer.py. ||d|| needs every term in a
+document, not just the query terms, so it's computed once over the whole
+postings file and cached (see `_document_norms()`), deferred until the first
+`vsm_score()` call so a BM25-only run never pays for it.
 """
 from collections import Counter
 from typing import List, Optional, Tuple

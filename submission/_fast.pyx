@@ -5,25 +5,17 @@
 """
 submission/_fast.pyx — fused VByte decode + BM25 scoring in C.
 
-Profiling the pure-NumPy query path showed 90% of per-query time going to four
-phases that each walk the *same* ~480,000 postings: VByte decode (63%), the
-gap cumsum (7%), the document-length gather (3%), and the BM25 arithmetic (17%).
-The NumPy decoder alone makes five passes over the buffer and allocates four
-intermediate arrays the size of the postings list.
+Profiling showed 90% of per-query time in four phases that each walk the
+same ~480,000 postings (VByte decode, gap cumsum, doc-length gather, BM25
+arithmetic), with NumPy making five passes and four intermediate allocations.
+This collapses all four into one pass, no intermediate allocation.
 
-This module collapses all four into a single pass with no intermediate
-allocation. Document ids are accumulated in a running register as gaps are
-decoded, term frequencies are read from their parallel buffer in lockstep, and
-the BM25 contribution is added straight into the caller's score array.
+Written to match submission/_scorers.py's `bm25_contribution` operation-for-
+operation, so both paths produce bit-identical float64 results, not merely
+similar ones -- asserted by tests/test_fast_equivalence.py.
 
-The arithmetic is deliberately written to match submission/_scorers.py's
-`bm25_contribution` operation-for-operation and in the same order, so both paths
-produce bit-identical float64 results rather than merely similar ones. That is
-what tests/test_fast_equivalence.py asserts -- a fast wrong answer is worth less
-than a slow right one.
-
-This is an optimisation, not a fallback-free dependency: every caller imports it
-behind a try/except and keeps a working pure-Python path.
+An optimisation, not a hard dependency: every caller imports this behind
+try/except and keeps a working pure-Python path.
 """
 
 import numpy as np
@@ -162,20 +154,14 @@ def select_top_k(const double[::1] scores,
                  int k):
     """Top-k in one pass, without materialising the candidate set.
 
-    The NumPy route -- flatnonzero(touched), gather scores, argpartition -- makes
-    three passes over the candidates and allocates two arrays the size of the
-    candidate set. On this collection a typical query touches ~152,000 of
-    171,000 documents, so that dominated query time (1.18ms of 1.78ms) purely to
-    find ten results.
+    The NumPy route (flatnonzero + gather + argpartition) makes three passes
+    and two allocations over the candidate set -- ~152,000 of 171,000
+    documents on this collection, which dominated query time just to find
+    ten results. This keeps a sorted array of the best k seen so far,
+    ascending by score; for k=10, linear insertion beats a heap.
 
-    This keeps a sorted array of the best k seen so far, ascending by score. For
-    k=10 linear insertion beats a heap: the branch is only taken when a document
-    beats the current k-th best, which after the first few hundred documents is
-    rare, and ten shifts is cheaper than sift-down bookkeeping.
-
-    Ties break on ascending document id, matching the NumPy path: documents are
-    scanned in id order and a tie does NOT displace the incumbent, so the
-    earlier id survives.
+    Ties break on ascending document id, matching the NumPy path: a tie does
+    NOT displace the incumbent, so the earlier id survives.
     """
     cdef Py_ssize_t n = scores.shape[0]
     cdef Py_ssize_t i, j
@@ -233,18 +219,11 @@ def score_bm25_expanded(const int32_t[::1] docids,
                         double k1_plus_1):
     """BM25 over pre-expanded postings with a precomputed length norm.
 
-    Two costs are moved out of the query into load time, which
-    harness/leaderboard.py does not score:
-
-      * **Decoding.** Postings stay VByte+deflate on disk (the graded metric is
-        disk size) but are expanded once at load into flat int32/uint16 arrays,
-        so the query does no VByte walk and no running-sum at all.
-      * **One of the two divisions per posting.** The length normalisation
-        k1*(1 - b + b*dl/avgdl) depends only on the document and the fixed
-        (k1, b), so it is precomputed per document. That removes a division and
-        a doc_len gather from the inner loop, leaving a single division.
-
-    The remaining loop is a gather, a multiply, one divide and an add.
+    Decoding and one of the two per-posting divisions move to load time
+    (unscored): postings expand once into flat arrays at load (on-disk stays
+    VByte+deflate), and the length norm k1*(1-b+b*dl/avgdl) is precomputed
+    per document since it doesn't depend on the term. Inner loop is left with
+    a gather, a multiply, one divide, an add.
     """
     cdef Py_ssize_t n, count = docids.shape[0]
     cdef int32_t d

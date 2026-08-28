@@ -1,27 +1,21 @@
 """
 submission/custom_scorer.py — the Sequential Dependence Model (SDM).
 
-Called out in the assignment (Section 4.1) as "where separation in the
-leaderboard tends to happen": a combination of signals beyond a single
-term-independent scorer.
-
-BM25, VSM and query-likelihood all assume query terms are independent. They
-cannot tell "rapid testing" from a document that mentions "rapid" in one
-sentence and "testing" three paragraphs later. SDM (Metzler & Croft 2005) adds
-that missing evidence as two extra feature classes over *adjacent* query terms:
+BM25, VSM and query-likelihood assume query terms are independent, so none of
+them can tell "rapid testing" from a document mentioning "rapid" and "testing"
+in unrelated sentences. SDM (Metzler & Croft 2005) adds that as two extra
+feature classes over *adjacent* query term pairs:
 
     score(D,Q) = lambda_T * sum_i      f_T(q_i, D)              unigrams
                + lambda_O * sum_i      f_O(q_i, q_i+1, D)       ordered  (#1)
                + lambda_U * sum_i      f_U(q_i, q_i+1, D)       unordered (#uw8)
 
-Only adjacent pairs are used -- that is what makes it *sequential* dependence
-rather than full dependence, which would need all 2^n term subsets.
+Only adjacent pairs -- that's what makes it *sequential* rather than full
+dependence, which would need all 2^n term subsets.
 
-Every f is BM25-saturated so the three feature classes share a scale and the
-lambdas stay interpretable. Ordered and unordered counts come from
-submission/_proximity.py and are computed only over the top-N candidates from
-the unigram pass, since proximity can rerank documents but cannot rescue a
-document that contains no query terms at all.
+Every f is BM25-saturated so the three feature classes share a scale. Ordered/
+unordered counts come from submission/_proximity.py, computed only over the
+unigram pass's top-N candidates.
 
 Wire this in from submission/retrieve.py's retrieve() instead of calling a
 single scorer directly.

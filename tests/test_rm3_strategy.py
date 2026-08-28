@@ -32,15 +32,14 @@ TOY_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "toy")
 CORPUS_PATH = os.path.join(TOY_DIR, "corpus.jsonl")
 
 
-def test_committed_default_is_the_dev_validated_strategy():
-    """A guard against shipping the higher-variance probe candidate by
-    accident. If this is failing because a probe day deliberately switched
-    ACTIVE_STRATEGY, that is expected -- update this test alongside the
-    switch, don't just delete it."""
-    assert entry.ACTIVE_STRATEGY == "shipped", (
-        "ACTIVE_STRATEGY is not 'shipped'. If this is a deliberate "
-        "competition-round probe, fine -- but confirm it is intentional "
-        "before this reaches the initial submission or final deadline."
+def test_committed_default_is_the_intended_strategy():
+    """A guard against ACTIVE_STRATEGY drifting by accident, not a fixed
+    opinion about which strategy should be active. Update the expected value
+    alongside any deliberate switch -- don't just delete this."""
+    assert entry.ACTIVE_STRATEGY == "rm3_stemmed", (
+        "ACTIVE_STRATEGY is not 'rm3_stemmed' (shipped for the 28 Aug initial "
+        "submission). If this is a deliberate switch, update this test's "
+        "expected value alongside it."
     )
 
 

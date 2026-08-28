@@ -1,30 +1,19 @@
 """
 submission/rm3.py — pseudo-relevance feedback over a stemmed analysis chain,
-combined with a pseudo-title field (see submission/retrieve.py's TITLE_WIDTH).
-
-An alternative to submission/bm25.py's plain-text ranking, selected by
-retrieve.py's ACTIVE_STRATEGY switch rather than run unconditionally. Both
-extra costs it carries -- a stemmed second index and a forward (doc -> terms)
-index for feedback-term extraction -- are paid only when this strategy is the
-one actually building/loading, never alongside the plain path.
+plus a stemmed pseudo-title field. Selected by retrieve.py's ACTIVE_STRATEGY.
 
 RM3 (Lavrenko & Croft 2001; Abdul-Jaleel et al. 2004):
 
     p(w|R)  =  sum over top-F feedback docs of  p(w|d) * p(q|d)     (RM1)
     q'      =  alpha * q_original  +  (1 - alpha) * top-m of RM1     (RM3)
 
-p(q|d) is approximated from the first-pass ranking score, min-max normalised
-into a distribution over the feedback set; p(w|d) is the document's own
-relative term frequency, tf/|d|. Both the feedback-document ranking and the
-final reranking score the SAME way: BM25 over the stemmed body plus the
-stemmed pseudo-title field, at the module's own tuned k1/b and title weight
--- not submission/bm25.py's, since this is a materially different analysis
-chain and the two were never assumed to share parameters.
+p(q|d) is the first-pass score, min-max normalised into a distribution over
+the feedback set; p(w|d) is tf/|d|. Both passes score the same way: BM25 over
+the stemmed body + title, at this module's own tuned k1/b and title weight
+(not bm25.py's -- different analysis chain, never assumed to share params).
 
-fb_docs=10, fb_terms=20, alpha=0.6 are the shipped defaults: the majority
-selection across a 5-fold cross-validation of a (fb_docs x fb_terms x alpha)
-grid, not a single argmax -- the same plateau-over-peak discipline applied to
-every other tuned parameter in this submission.
+fb_docs=10, fb_terms=20, alpha=0.6: majority pick across a 5-fold CV of the
+(fb_docs, fb_terms, alpha) grid, not a single argmax.
 """
 from collections import defaultdict
 from typing import List, Optional, Tuple
@@ -61,9 +50,8 @@ def build(body_index: InvertedIndex, title_index: InvertedIndex) -> None:
             "the feedback step has no term vectors to read otherwise"
         )
     if title_index.N != body_index.N:
-        # _field_score()'s score/touched arrays are sized to _BODY.N and index
-        # the title field with the SAME internal doc ids -- only valid because
-        # both are built from the same corpus in the same document order.
+        # _field_score() indexes the title field with _BODY's internal doc
+        # ids -- only valid if both come from the same corpus build.
         raise RuntimeError(
             f"body and title indexes disagree on document count "
             f"({body_index.N} vs {title_index.N}); they must come from the "
@@ -144,11 +132,8 @@ def score(query: str, k: int, fb_docs: int = FB_DOCS, fb_terms: int = FB_TERMS,
     if not feedback_docs:
         return []
 
-    # p(q|d): min-max normalise the first-pass scores into a distribution
-    # over the feedback set. A document scoring exactly the set's minimum
-    # gets zero influence rather than a small positive one -- deliberately,
-    # since a min-max floor of zero is what stops the single weakest feedback
-    # document from still perturbing the expansion.
+    # p(q|d): min-max normalise the first-pass scores over the feedback set,
+    # so the weakest feedback document gets exactly zero influence.
     raw_scores = np.array([s for _d, s in feedback_docs], dtype=np.float64)
     shifted = raw_scores - raw_scores.min()
     doc_weights = (shifted / shifted.sum() if shifted.sum() > 0

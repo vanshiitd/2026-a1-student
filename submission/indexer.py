@@ -1,37 +1,23 @@
 """
 submission/indexer.py — the inverted index (assignment Section 4.1).
 
-Built from scratch: no Lucene/Elasticsearch/Pyserini/Whoosh. Only NumPy (for
-array manipulation) and the standard library.
+Columnar arrays, not a dict-of-dicts: at 16.3M postings the obvious
+Dict[str, Dict[str, int]] shape costs several GB of pure interpreter overhead,
+which won't fit the 8GB grading machine.
 
-Representation
---------------
-Columnar, not a dict-of-dicts. The obvious `Dict[str, Dict[str, int]]` shape
-costs a Python object per posting; at 16.3M postings (measured, see
-notes/corpus_profile.md) that is several GB of interpreter overhead alone and
-would not fit the 8GB grading machine. Instead every per-term and per-posting
-quantity lives in a flat NumPy array:
+    terms[t]           term string, sorted ascending
+    df[t], cf[t]        document / collection frequency
+    docid_off[t:t+2]    byte slice of this term's docids in `_docid_buf`
+    term_start[t]       index of this term's first posting; also its nibble
+                        offset into the packed tf array
+    doc_len[d]           document length in tokens
+    doc_ids[d]           external doc_id string for internal id d
 
-    terms[t]                 term string, sorted ascending
-    df[t], cf[t]             document frequency, collection frequency
-    docid_off[t:t+2]         byte slice of this term's docids in `_docid_buf`
-    term_start[t]            index of this term's first posting; also its
-                             nibble offset into the packed tf array
-    doc_len[d]               document length in tokens
-    doc_ids[d]               external doc_id string for internal id d
-
-Postings are delta+VByte encoded (see submission/_codecs.py). Both the encode
-and decode paths are vectorised, and the *whole collection* is encoded in a
-single `vbyte_encode` call rather than once per term -- per-term calls would pay
-NumPy's fixed overhead ~200K times and dominate the graded build time.
-
-Persistence
------------
-`save()`/`load()` round-trip through plain files with no pickling, so an index
-written by one process is readable by a fresh one with no shared state (which is
-exactly what the harness verifies). The on-disk size is a graded leaderboard
-component (assignment Section 7), so nothing is persisted that `retrieve()` does
-not need -- in particular the raw document text is deliberately NOT stored.
+Postings are delta+VByte encoded (submission/_codecs.py), the whole
+collection in one vectorised call rather than per-term. save()/load() round-
+trip through plain files with no pickling and no shared state between
+processes, and store nothing retrieve() doesn't need -- raw document text is
+never persisted.
 """
 import json
 import os
@@ -56,18 +42,10 @@ except ImportError:  # pragma: no cover - exercised by the fallback test
 
 FORMAT_VERSION = 3   # 3: index files zlib-compressed on disk
 
-# Every index file is deflated before it hits disk. The graded metric is the
-# on-disk byte size (assignment Section 7), and the interface contract
-# explicitly suggests compressing what is persisted.
-#
-# Level 4 is chosen from a measured curve, not by default. Compression runs
-# inside save(), hence inside build_index(), so it is charged against the
-# index-build-time metric; decompression runs in load(), whose time
-# harness/leaderboard.py does NOT score. Measured on the real index:
-#     level 1 -> 22.20 MB, 0.40s compress
-#     level 4 -> 21.57 MB, 0.60s compress
-#     level 9 -> 21.22 MB, 7.27s compress   (1MB more for 7s -- rejected)
-# Decompression is ~0.05s at any level.
+# Every index file is deflated on disk. Level 4 from a measured curve, not the
+# default: compression is charged against build time (level 1 -> 22.20MB/0.40s,
+# level 4 -> 21.57MB/0.60s, level 9 -> 21.22MB/7.27s -- not worth it),
+# decompression in load() isn't graded and is ~0.05s regardless of level.
 _ZLIB_LEVEL = 4
 
 # Postings accumulated in Python lists before being flushed to NumPy arrays.
@@ -175,13 +153,10 @@ class InvertedIndex:
     def _build(self, docs: Iterable[Tuple[str, str]]) -> None:
         if self.store_positions:
             return self._build_positional(docs)
-        # The forward index is built inside _finalise_postings(), which only
-        # the Python path calls; _build_counts_fast() bypasses it entirely for
-        # speed. Route there whenever a forward index was requested, exactly
-        # as store_positions already forces the positional path. In practice
-        # this never costs anything: the only chain that requests a forward
-        # index (the stemmed RM3 chain, submission/rm3.py) already uses the
-        # Python path anyway, since the C++ builder declines stemmed configs.
+        # The forward index is built inside _finalise_postings(), which the C++
+        # fast path bypasses. Route to Python whenever it's requested -- costs
+        # nothing in practice since the only chain that wants one (stemmed RM3)
+        # already declines the C++ builder anyway.
         if self.store_forward:
             return self._build_counts(docs)
         if _FASTBUILD is not None and _FASTBUILD.Builder.supports(self.config):
@@ -258,12 +233,10 @@ class InvertedIndex:
     def _build_positional(self, docs: Iterable[Tuple[str, str]]) -> None:
         """Build with term positions retained, for proximity/phrase scoring.
 
-        Emits one (term, doc, position) triple per token occurrence rather than
-        one (term, doc, tf) triple per distinct term, then recovers tf by
-        grouping. That means term frequency never has to be counted separately:
-        a posting's tf is exactly how many positions it owns, which also means
-        the positions file needs no per-posting offset table -- the existing tf
-        values already delimit it.
+        Emits one (term, doc, position) triple per token occurrence and
+        recovers tf by grouping, so a posting's tf is exactly how many
+        positions it owns -- no separate offset table needed for the
+        positions file.
         """
         analyzer = make_analyzer(self.config)
         provisional: Dict[str, int] = {}
@@ -453,11 +426,8 @@ class InvertedIndex:
         term_ids = remap[term_ids]
 
         if self.store_forward:
-            # Built here, not after the term-major sort below: this is the one
-            # point where (doc, term, tf) triples exist with final term ids but
-            # have not yet been reordered away from a form ForwardIndex.build()
-            # can re-sort doc-major itself. Costs one extra pass over the same
-            # triples the postings encoding below already uses.
+            # Built here, before the term-major sort below reorders these
+            # triples away from a form ForwardIndex.build() can re-sort itself.
             from submission._forward import ForwardIndex
             self.forward = ForwardIndex.build(docs_arr, term_ids, tfs_arr, self.N)
 

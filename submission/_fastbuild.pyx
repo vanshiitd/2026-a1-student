@@ -5,34 +5,22 @@
 """
 submission/_fastbuild.pyx — tokenisation and posting emission in C++.
 
-Phase-timing the build put 69% of it in three pure-Python phases: the
-per-token tokenisation loop (37%), `Counter` plus ~16.3M list appends (25%),
-and converting those lists to NumPy arrays (6%). The remaining 31% -- lexsort
-and VByte encoding -- is already NumPy and has little headroom.
+Phase-timing put 69% of the build in tokenisation, Counter + ~16.3M list
+appends, and converting those lists to NumPy arrays -- because every one of
+~29M tokens became a Python str object just to be looked up in the vocabulary
+dict. Here tokens stay as raw bytes, interned through a C++
+unordered_map<string, int>, so no Python object is created per token.
 
-The expensive part is not the scanning, it is that every one of ~29M tokens
-becomes a Python `str` object purely to be looked up in the vocabulary dict.
-This module avoids that entirely: tokens stay as raw bytes and are interned
-through a C++ `unordered_map<string, int>`, so no Python object is created per
-token. Short tokens fit in std::string's small-string optimisation and do not
-allocate at all.
+Per-document term frequencies are counted in an O(1) scratch vector indexed
+by term id, with a touched-list to reset only what was used.
 
-Per-document term frequencies are counted in an O(1) scratch vector indexed by
-term id, with a touched-list to reset only the entries actually used -- rather
-than building a `Counter` per document.
+`text.lower()` stays in Python (already C-speed, handles Unicode case
+mapping) before this scans the UTF-8 bytes for [a-z0-9]+ runs -- UTF-8
+continuation bytes are all >= 0x80 so can never be mistaken for ASCII
+alphanumerics, meaning this produces exactly the tokens Python's `re` would.
 
-Exactness
----------
-`text.lower()` is still done in Python (it is already C-speed and handles the
-full Unicode case mapping), then encoded to UTF-8 and scanned here for
-`[a-z0-9]+` runs. UTF-8 continuation bytes are all >= 0x80 and so can never be
-mistaken for ASCII alphanumerics, which makes the byte scan produce exactly the
-tokens Python's `re` pattern would.
-
-Only the default analysis chain is supported -- no stemming, stopwords or
-alphanumeric splitting. `Builder.supports()` reports that, and the caller falls
-back to the Python path for any other configuration rather than silently
-producing a different index.
+Only the default analysis chain is supported; `Builder.supports()` reports
+that, and the caller falls back to Python for anything else.
 """
 
 import numpy as np
@@ -62,12 +50,10 @@ cdef class Builder:
     cdef vector[string] term_bytes          # term id -> its bytes, for the dictionary
     cdef vector[int] scratch_tf             # term id -> tf within the current document
     cdef vector[int] touched                # term ids used by the current document
-    # Postings held per term rather than in one document-ordered stream. This
-    # is what removes the global sort: documents are processed in ascending id
-    # order, so each term's doc list is built already ascending, and grouping by
-    # term is exactly what a per-term vector is. The previous layout needed a
-    # 16.3M-element np.lexsort afterwards to recover both properties -- 3.06s of
-    # a 5.78s build.
+    # Postings held per term, not one document-ordered stream: documents are
+    # processed in ascending id order, so each term's doc list is already
+    # ascending, removing the 16.3M-element np.lexsort the old layout needed
+    # (3.06s of a 5.78s build).
     cdef vector[vector[int32_t]] post_docs
     cdef vector[vector[int32_t]] post_tfs
     cdef Py_ssize_t max_token_len

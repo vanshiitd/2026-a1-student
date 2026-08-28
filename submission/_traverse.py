@@ -1,18 +1,11 @@
 """
 submission/_traverse.py — one postings traversal, N scorers.
 
-The rule this module exists to enforce: **decode each query term's postings
-exactly once**, then hand the decoded arrays to every active scorer. Running
-four rankers must not cost four traversals, or plan.md Section 5.0's
-"fuse, don't select" strategy would be unaffordable at query time.
-
-Current candidate generation is a full accumulate over each query term's
-postings (a "term-at-a-time" scan). That is already fast -- a ~12-token query on
-this collection touches a few hundred thousand postings, decoded with vectorised
-NumPy -- and, critically, it is *exact*: it produces the true top-k, so it can
-serve as the correctness oracle for the WAND / BlockMax-WAND early-termination
-path scheduled for 23 Aug (plan.md Section 7). Optimise against a known-correct
-baseline, not instead of one.
+Decodes each query term's postings exactly once and hands the arrays to
+every active scorer, so running several rankers doesn't cost several
+traversals. Term-at-a-time full accumulate: exact (produces the true top-k),
+and fast enough at this collection's scale that early termination isn't
+needed.
 """
 from collections import Counter
 from typing import Dict, List, Optional, Sequence, Tuple
