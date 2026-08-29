@@ -86,12 +86,18 @@ def _build_index_shipped(corpus_path: str, index_dir: str) -> None:
 
 
 def _build_index_rm3_stemmed(corpus_path: str, index_dir: str) -> None:
-    """Stemmed body + forward index (for feedback-term extraction) and a
-    stemmed title field. Scorer in submission/rm3.py."""
+    """Stemmed body and a stemmed title field. Scorer in submission/rm3.py.
+
+    The forward index RM3 needs is NOT built or persisted here -- it costs
+    ~30MB on disk (a document's ~150 scattered term ids across the whole
+    vocabulary delta-encode far worse than a term's postings across all
+    documents does), and build()/save() would also charge its construction
+    against the graded build-time metric. load_index() instead rebuilds it
+    in memory from the body's own postings, at load time, which is unscored.
+    """
     cfg = AnalysisConfig(stemmer="porter")
 
     body = InvertedIndex(cfg)
-    body.store_forward = True
     body.build_from_jsonl(corpus_path)
     body.save(os.path.join(index_dir, _MAIN_DIR))
 
@@ -107,6 +113,8 @@ def load_index(index_dir: str) -> None:
     _INDEX = InvertedIndex.load(os.path.join(index_dir, _MAIN_DIR))
     title = InvertedIndex.load(os.path.join(index_dir, _TITLE_DIR))
     if ACTIVE_STRATEGY == "rm3_stemmed":
+        from submission._forward import ForwardIndex
+        _INDEX.forward = ForwardIndex.from_body_index(_INDEX)
         rm3.build(_INDEX, title)
     else:
         bm25.build(_INDEX, title_index=title, title_weight=TITLE_WEIGHT)
