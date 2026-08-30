@@ -16,13 +16,13 @@ along the way are in the accompanying report, submitted separately.
 
 | | dev set (50 topics, 171,332 docs) |
 |---|---|
-| nDCG@10 | **0.6846** |
+| nDCG@10 | **0.6837** |
 | MAP@10 | 0.0172 *(ceiling on this collection is ~0.027 — see the report)* |
 | MRR / P@10 | 0.8583 / 0.7700 |
 | Index size | **21.5 MB** |
 | Index build | 17.8 s |
 | Index load | 2.0 s |
-| Query latency | 19.2 ms mean |
+| Query latency | 17.4 ms mean |
 
 RM3's own forward index (needed for feedback-term extraction) is built in
 memory at load time rather than persisted to disk — a document's handful of
@@ -34,7 +34,7 @@ from 24s to 17.8s with byte-identical retrieval quality.
 
 The alternative, `"shipped"` (plain BM25, `k1=4.5, b=0.60`, plus an unstemmed
 pseudo-title field — no feedback pass), is slightly larger (22.8 MB) but
-~5x faster to build and ~29x lower query latency, and scores 0.6395 nDCG@10
+~5x faster to build and ~27x lower query latency, and scores 0.6395 nDCG@10
 on the same dev topics. RM3's dev-set advantage is real but has never crossed
 the p<0.05 significance bar this project holds every other change to (best
 honest estimate: p≈0.05–0.08 across four independent tests) and has an
