@@ -21,7 +21,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from submission import bm25 as _bm25mod
-from submission._analysis import analyze
+from submission._analysis import make_analyzer
 from submission._scorers import robertson_idf
 from submission.indexer import InvertedIndex
 
@@ -29,6 +29,7 @@ _BODY: Optional[InvertedIndex] = None
 _TITLE: Optional[InvertedIndex] = None
 _FORWARD = None  # submission._forward.ForwardIndex, bound to _BODY
 _DOC_ID_TO_INTERNAL: dict = {}  # built once in build(); never changes per query
+_ANALYZE = None  # a persistent _Analyzer for _BODY.config, built once in build()
 
 K1 = 4.5
 B = 0.60
@@ -44,7 +45,7 @@ def build(body_index: InvertedIndex, title_index: InvertedIndex) -> None:
     `body_index.forward` must be set (built with `store_forward=True`) --
     RM3's feedback step reads it directly. Called from retrieve.load_index().
     """
-    global _BODY, _TITLE, _FORWARD, _DOC_ID_TO_INTERNAL
+    global _BODY, _TITLE, _FORWARD, _DOC_ID_TO_INTERNAL, _ANALYZE
     if body_index.forward is None:
         raise RuntimeError(
             "rm3.build() requires body_index.store_forward=True at build time; "
@@ -63,6 +64,16 @@ def build(body_index: InvertedIndex, title_index: InvertedIndex) -> None:
     # all N doc_ids on every score() call for no reason -- it never changes
     # once the index is loaded.
     _DOC_ID_TO_INTERNAL = {ext_id: i for i, ext_id in enumerate(_BODY.doc_ids)}
+    # A persistent analyzer, not the analyze() free function: that function
+    # constructs a brand-new _Analyzer (and thus a brand-new PorterStemmer,
+    # re-importing nltk.stem the first time) on every call whenever the
+    # config isn't the module default -- which a stemmed config never is.
+    # That charged NLTK's one-time import cost to query one (measured:
+    # ~500ms) and threw away the stem cache after every single query. Built
+    # once here instead, and warmed immediately so the cost lands at load
+    # time, which is unscored.
+    _ANALYZE = make_analyzer(_BODY.config)
+    _ANALYZE("warm")
     # Warm the same query-time caches submission/bm25.py uses, for the same
     # reason: load time is not a scored metric, per-query latency is.
     if _bm25mod.HAVE_FAST:
@@ -186,7 +197,7 @@ def score(query: str, k: int, fb_docs: int = FB_DOCS, fb_terms: int = FB_TERMS,
     if k <= 0:
         return []
 
-    query_terms = list(dict.fromkeys(analyze(query, _BODY.config)))
+    query_terms = list(dict.fromkeys(_ANALYZE(query)))
     if not query_terms:
         return []
     base_weight = {t: 1.0 / len(query_terms) for t in query_terms}
