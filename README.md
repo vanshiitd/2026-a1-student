@@ -22,7 +22,7 @@ along the way are in the accompanying report, submitted separately.
 | Index size | **21.5 MB** |
 | Index build | 2.7 s *(4 cores; ~4.4s on 1)* |
 | Index load | ~2 s |
-| Query latency | ~11–13 ms mean |
+| Query latency | ~2.5 ms mean |
 
 Three independent optimisations get RM3 here from an original 51MB / 24s
 build / 19ms query, with byte-identical retrieval quality confirmed at every
@@ -47,9 +47,10 @@ step (nDCG@10/MAP@10/MRR/P@10 unchanged throughout):
 
 The alternative, `"shipped"` (plain BM25, `k1=4.5, b=0.60`, plus an unstemmed
 pseudo-title field — no feedback pass), is slightly larger (23.96 MB, since
-it carries no forward index at all) but now builds in almost exactly the
-same time (2.9s) and has much lower query latency (0.65 ms, since it has no
-feedback pass to run), and scores 0.6395 nDCG@10 on the same dev topics.
+it carries no forward index at all), builds in almost exactly the same time
+(2.9s), and still has lower query latency (0.65 ms vs RM3's ~2.5 ms — a much
+smaller gap than before RM3's own query-path fixes, since it has no feedback
+pass to run), and scores 0.6395 nDCG@10 on the same dev topics.
 RM3's dev-set advantage is real but has never crossed the p<0.05 significance
 bar this project holds every other change to (best honest estimate: p≈0.05–0.08
 across four independent tests) and has an
