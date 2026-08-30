@@ -85,10 +85,17 @@ def _field_score(terms_weighted: dict, k: int, depth: Optional[int] = None
             _accumulate_numpy_single(_BODY, term, weight, scores, touched)
             _accumulate_numpy_single(_TITLE, term, weight * TITLE_WEIGHT, scores, touched)
 
+    limit = depth or k
+    if _bm25mod.HAVE_FAST:
+        candidates, values = _bm25mod._fast.select_top_k(scores, touched, limit)
+        if candidates.size == 0:
+            return []
+        return [(_BODY.doc_ids[int(candidates[i])], float(values[i]))
+                for i in range(candidates.size)]
+
     candidates = np.flatnonzero(touched)
     if candidates.size == 0:
         return []
-    limit = depth or k
     values = scores[candidates]
     if candidates.size > limit:
         top = np.argpartition(-values, limit - 1)[:limit]
