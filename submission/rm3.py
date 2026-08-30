@@ -28,6 +28,7 @@ from submission.indexer import InvertedIndex
 _BODY: Optional[InvertedIndex] = None
 _TITLE: Optional[InvertedIndex] = None
 _FORWARD = None  # submission._forward.ForwardIndex, bound to _BODY
+_DOC_ID_TO_INTERNAL: dict = {}  # built once in build(); never changes per query
 
 K1 = 4.5
 B = 0.60
@@ -43,7 +44,7 @@ def build(body_index: InvertedIndex, title_index: InvertedIndex) -> None:
     `body_index.forward` must be set (built with `store_forward=True`) --
     RM3's feedback step reads it directly. Called from retrieve.load_index().
     """
-    global _BODY, _TITLE, _FORWARD
+    global _BODY, _TITLE, _FORWARD, _DOC_ID_TO_INTERNAL
     if body_index.forward is None:
         raise RuntimeError(
             "rm3.build() requires body_index.store_forward=True at build time; "
@@ -58,6 +59,10 @@ def build(body_index: InvertedIndex, title_index: InvertedIndex) -> None:
             f"same corpus build"
         )
     _BODY, _TITLE, _FORWARD = body_index, title_index, body_index.forward
+    # Built once here rather than per query: this used to be rebuilt from
+    # all N doc_ids on every score() call for no reason -- it never changes
+    # once the index is loaded.
+    _DOC_ID_TO_INTERNAL = {ext_id: i for i, ext_id in enumerate(_BODY.doc_ids)}
     # Warm the same query-time caches submission/bm25.py uses, for the same
     # reason: load time is not a scored metric, per-query latency is.
     if _bm25mod.HAVE_FAST:
@@ -122,6 +127,57 @@ def _accumulate_numpy_single(index: InvertedIndex, term: str, weight: float,
     touched[doc_ids] = True
 
 
+def _feedback_mass(feedback_docs: List[Tuple[str, float]], doc_weights: np.ndarray,
+                   fb_terms: int) -> List[Tuple[int, float]]:
+    """RM1 mass per term_id across the feedback set, top `fb_terms` returned
+    as (term_id, mass), descending by mass.
+
+    Per-document decode stays in Python via ForwardIndex (already correct,
+    already tested); only the accumulation across up to FB_DOCS small
+    per-document arrays moves to C -- eliminating a defaultdict with roughly
+    fb_docs * ~200 Python-level dict updates on every single query.
+    """
+    term_id_chunks, tf_chunks, offsets, weights, doc_lens = [], [], [0], [], []
+    for (doc_id, _score), doc_weight in zip(feedback_docs, doc_weights):
+        internal_id = _DOC_ID_TO_INTERNAL[doc_id]
+        term_ids, tfs = _FORWARD.terms_and_tfs(internal_id)
+        term_id_chunks.append(term_ids)
+        tf_chunks.append(tfs)
+        offsets.append(offsets[-1] + term_ids.size)
+        weights.append(float(doc_weight))
+        doc_lens.append(float(max(int(_BODY.doc_len[internal_id]), 1)))
+
+    if _bm25mod.HAVE_FAST:
+        all_term_ids = (np.concatenate(term_id_chunks) if term_id_chunks
+                        else np.zeros(0, dtype=np.int64))
+        all_tfs = (np.concatenate(tf_chunks) if tf_chunks
+                  else np.zeros(0, dtype=np.int64))
+        mass = np.zeros(len(_BODY.terms), dtype=np.float64)
+        _bm25mod._fast.accumulate_feedback_mass(
+            all_term_ids.astype(np.int64), all_tfs.astype(np.int64),
+            np.asarray(offsets, dtype=np.int64),
+            np.asarray(weights, dtype=np.float64),
+            np.asarray(doc_lens, dtype=np.float64), mass)
+        touched = np.flatnonzero(mass)
+        if touched.size == 0:
+            return []
+        values = mass[touched]
+        if touched.size > fb_terms:
+            top = np.argpartition(-values, fb_terms - 1)[:fb_terms]
+            touched, values = touched[top], values[top]
+        # Ties broken on ascending term id -- this project's standard
+        # tie-break elsewhere; an exact mass collision is vanishingly
+        # unlikely for these continuous-valued sums in the first place.
+        order = np.lexsort((touched, -values))
+        return [(int(touched[i]), float(values[i])) for i in order]
+
+    feedback_term_mass: dict = defaultdict(float)
+    for term_ids, tfs, w, dl in zip(term_id_chunks, tf_chunks, weights, doc_lens):
+        for term_id, tf in zip(term_ids, tfs):
+            feedback_term_mass[int(term_id)] += w * (tf / dl)
+    return sorted(feedback_term_mass.items(), key=lambda kv: -kv[1])[:fb_terms]
+
+
 def score(query: str, k: int, fb_docs: int = FB_DOCS, fb_terms: int = FB_TERMS,
          alpha: float = ALPHA) -> List[Tuple[str, float]]:
     """Return up to k (doc_id, score) pairs for `query`, RM3-reranked."""
@@ -146,16 +202,7 @@ def score(query: str, k: int, fb_docs: int = FB_DOCS, fb_terms: int = FB_TERMS,
     doc_weights = (shifted / shifted.sum() if shifted.sum() > 0
                   else np.full(len(feedback_docs), 1.0 / len(feedback_docs)))
 
-    doc_id_to_internal = {ext_id: i for i, ext_id in enumerate(_BODY.doc_ids)}
-    feedback_term_mass: dict = defaultdict(float)
-    for (doc_id, _score), doc_weight in zip(feedback_docs, doc_weights):
-        internal_id = doc_id_to_internal[doc_id]
-        term_ids, tfs = _FORWARD.terms_and_tfs(internal_id)
-        doc_len = max(int(_BODY.doc_len[internal_id]), 1)
-        for term_id, tf in zip(term_ids, tfs):
-            feedback_term_mass[int(term_id)] += doc_weight * (tf / doc_len)
-
-    top_feedback = sorted(feedback_term_mass.items(), key=lambda kv: -kv[1])[:fb_terms]
+    top_feedback = _feedback_mass(feedback_docs, doc_weights, fb_terms)
     feedback_mass_sum = sum(v for _t, v in top_feedback) or 1.0
 
     expanded_query: dict = defaultdict(float)

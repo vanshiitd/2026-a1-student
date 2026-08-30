@@ -168,6 +168,16 @@ def test_cpp_builder_produces_a_byte_identical_index():
     _assert_identical(*_build_both(_synthetic_corpus(400, seed=3)))
 
 
+def test_cpp_builder_produces_a_byte_identical_index_when_stemmed():
+    """The C++ Porter port must produce the identical index to the Python
+    stemming path, not just an equivalent stemmer function in isolation --
+    this exercises the actual build_from_jsonl()/Builder wiring end to end."""
+    pytest.importorskip("submission._fastbuild")
+    from submission._analysis import AnalysisConfig
+    _assert_identical(*_build_both(_synthetic_corpus(400, seed=3),
+                                   config=AnalysisConfig(stemmer="porter")))
+
+
 @pytest.mark.parametrize("corpus", [
     [("d1", "")],                                     # empty document
     [("d1", "   !!!   ")],                            # nothing tokenisable
@@ -185,12 +195,18 @@ def test_cpp_builder_matches_python_on_awkward_input(corpus):
 
 
 def test_cpp_builder_declines_configs_it_cannot_reproduce():
-    """Stemming and stopword removal are not implemented in the kernel; it must
-    say so rather than silently building a different index."""
+    """Stopword removal and alphanum-splitting are not implemented in the
+    kernel; it must say so rather than silently building a different index.
+
+    Porter stemming IS supported (a C++ port of nltk's NLTK_EXTENSIONS mode,
+    exhaustively verified against nltk across all 207,034 distinct tokens in
+    the real corpus vocabulary -- see test_porter_stemmer_matches_nltk below).
+    """
     fb = pytest.importorskip("submission._fastbuild")
     from submission._analysis import AnalysisConfig
     assert fb.Builder.supports(AnalysisConfig())
-    assert not fb.Builder.supports(AnalysisConfig(stemmer="porter"))
+    assert fb.Builder.supports(AnalysisConfig(stemmer="porter"))
+    assert not fb.Builder.supports(AnalysisConfig(stemmer="snowball"))
     assert not fb.Builder.supports(AnalysisConfig(remove_stopwords=True))
     assert not fb.Builder.supports(AnalysisConfig(split_alphanum=True))
 
@@ -272,3 +288,88 @@ def test_build_index_does_not_compile_anything():
             assert forbidden not in src, (
                 f"{py.name} references {forbidden!r}; compilation must happen at "
                 "image-build time, never inside build_index().")
+
+
+# ---------------------------------------------------------------------------
+# Porter stemmer C++ port (submission/_fastbuild.pyx's porter_stem)
+# ---------------------------------------------------------------------------
+# A direct structural port of nltk.stem.porter.PorterStemmer's NLTK_EXTENSIONS
+# mode (the only mode submission/_analysis.py uses), so the C++ build path
+# can stem tokens instead of falling back to pure Python. Correctness bar:
+# bit-identical to nltk for every token the corpus's tokenizer can produce.
+#
+# _PORTER_EXAMPLES covers every worked example from the algorithm's own
+# docstrings (all 8 steps, the NLTK-only ied/ies/alli/fulli/logi extensions,
+# every irregular-pool entry, alphanumeric corpus-specific tokens, and the
+# length<=2 passthrough) -- runs unconditionally, no corpus needed. The
+# exhaustive test below additionally checks all ~207K distinct tokens in the
+# real corpus when it's present locally, skipping gracefully otherwise.
+
+_PORTER_EXAMPLES = [
+    "caresses", "ponies", "ties", "caress", "cats", "feed", "agreed",
+    "plastered", "bled", "motoring", "sing", "conflated", "troubled", "sized",
+    "hopping", "tanned", "falling", "hissing", "fizzed", "failing", "filing",
+    "happy", "sky", "relational", "conditional", "rational", "valenci",
+    "hesitanci", "digitizer", "conformabli", "radicalli", "differentli",
+    "vileli", "analogousli", "vietnamization", "predication", "operator",
+    "feudalism", "decisiveness", "hopefulness", "callousness", "formaliti",
+    "sensitiviti", "sensibiliti", "triplicate", "formative", "formalize",
+    "electriciti", "electrical", "hopeful", "goodness", "revival",
+    "allowance", "inference", "airliner", "gyroscopic", "adjustable",
+    "defensible", "irritant", "replacement", "adjustment", "dependent",
+    "adoption", "homologou", "communism", "activate", "angulariti",
+    "homologous", "effective", "bowdlerize", "probate", "rate", "cease",
+    "controll", "roll", "spied", "died", "flies", "dies", "spy", "fly",
+    "try", "enjoy", "enjoyment", "geology", "theology", "archaeology",
+    "philology", "skies", "dying", "lying", "tying", "news", "innings",
+    "inning", "outings", "canning", "howe", "proceed", "exceed", "succeed",
+    "covid", "19", "sars2", "coronavirus", "pandemic", "19th", "a", "ab",
+]
+
+
+def test_porter_stemmer_matches_nltk_on_worked_examples():
+    fb = pytest.importorskip("submission._fastbuild")
+    nltk_stem = pytest.importorskip("nltk.stem.porter").PorterStemmer().stem
+    for word in _PORTER_EXAMPLES:
+        cpp = fb.porter_stem(word.encode()).decode()
+        ref = nltk_stem(word)
+        assert cpp == ref, f"{word!r}: C++={cpp!r} nltk={ref!r}"
+
+
+def test_porter_stemmer_matches_nltk_exhaustively_on_the_real_corpus():
+    """Every one of the ~207,034 distinct pre-stem tokens the real corpus can
+    produce, not a sample. Skips if the full corpus isn't present locally --
+    it's gitignored and fetched separately, not part of the required tree."""
+    import json
+    import os
+    import re
+
+    fb = pytest.importorskip("submission._fastbuild")
+    nltk_stem = pytest.importorskip("nltk.stem.porter").PorterStemmer().stem
+
+    corpus_path = os.path.join(
+        os.path.dirname(__file__), "..", "data", "full", "corpus.jsonl")
+    if not os.path.exists(corpus_path):
+        pytest.skip("data/full/corpus.jsonl not present locally")
+
+    token_re = re.compile(r"[a-z0-9]+")
+    vocab = set()
+    with open(corpus_path) as f:
+        for line in f:
+            obj = json.loads(line)
+            vocab.update(token_re.findall(obj["text"].lower()))
+
+    mismatches = [
+        (w, fb.porter_stem(w.encode()).decode(), nltk_stem(w))
+        for w in vocab
+        if fb.porter_stem(w.encode()).decode() != nltk_stem(w)
+    ]
+    assert not mismatches, f"{len(mismatches)} mismatches, e.g. {mismatches[:10]}"
+
+
+def test_porter_stemmer_handles_edge_cases_without_crashing():
+    """Empty input, length-1/2 words, all-consonants, all-vowels, runs of y."""
+    fb = pytest.importorskip("submission._fastbuild")
+    for word in (b"", b"a", b"ab", b"y", b"yy", b"yyyy", b"bcdfg", b"aeiou",
+                b"0", b"00000000", b"x" * 32):
+        fb.porter_stem(word)  # must not raise

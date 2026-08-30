@@ -172,7 +172,8 @@ class InvertedIndex:
         reproduces exactly; any other configuration falls back to Python rather
         than risking a silently different index.
         """
-        builder = _FASTBUILD.Builder(self.config.min_token_len, self.config.max_token_len)
+        builder = _FASTBUILD.Builder(self.config.min_token_len, self.config.max_token_len,
+                                     self.config.stemmer == "porter")
         doc_ids: List[str] = []
         doc_lens: List[int] = []
         for internal_id, (ext_id, text) in enumerate(docs):
