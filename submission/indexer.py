@@ -20,6 +20,7 @@ processes, and store nothing retrieve() doesn't need -- raw document text is
 never persisted.
 """
 import json
+import multiprocessing
 import os
 import zlib
 from collections import Counter
@@ -30,6 +31,11 @@ import numpy as np
 from submission._analysis import AnalysisConfig, make_analyzer
 from submission._codecs import (pack_tf_nibbles, unpack_tf_nibbles, vbyte_decode,
                                 vbyte_encode, vbyte_widths)
+
+# Below this many documents, splitting across processes costs more (spawn +
+# pickle + merge) than it could ever save. The toy corpus (20 docs) and small
+# test fixtures always take the serial path; this is not a graded corpus size.
+_PARALLEL_MIN_DOCS = 20_000
 
 # Optional C++ kernel for tokenising and posting emission (see
 # submission/_fastbuild.pyx). Imported behind try/except: without it the build
@@ -88,6 +94,88 @@ def _iter_jsonl(path: str) -> Iterator[Tuple[str, str]]:
                 continue
             obj = json.loads(line)
             yield obj["doc_id"], obj["text"]
+
+
+def _split_byte_ranges(corpus_path: str, n_workers: int):
+    """Newline-aligned byte offsets splitting the file into `n_workers`
+    roughly-equal pieces, plus each piece's starting internal doc id.
+
+    One sequential pass over line boundaries, not the document content --
+    the file is never materialised in the main process, preserving
+    build_from_jsonl()'s memory-safe streaming property. Internal doc ids
+    must equal file line order (many things assume this), so each worker
+    needs to know exactly how many non-blank lines precede its range.
+    """
+    size = os.path.getsize(corpus_path)
+    target = size // n_workers
+    ranges = []
+    doc_id_start = 0
+    with open(corpus_path, "rb") as f:
+        pos = 0
+        for w in range(n_workers):
+            start = pos
+            if w == n_workers - 1:
+                end = size
+            else:
+                seek_to = min(start + target, size)
+                f.seek(seek_to)
+                f.readline()  # consume the partial line; land on a boundary
+                end = f.tell()
+            # Count non-blank lines in [start, end) to get the NEXT worker's
+            # doc_id_start -- cheap relative to JSON-decoding the same bytes.
+            f.seek(start)
+            n_lines = 0
+            while f.tell() < end:
+                line = f.readline()
+                if line.strip():
+                    n_lines += 1
+            ranges.append((start, end, doc_id_start))
+            doc_id_start += n_lines
+            pos = end
+    return ranges
+
+
+def _parallel_build_worker(args):
+    """Runs in a separate process: tokenise/stem/intern one byte range of the
+    corpus with its own local Builder, return everything needed to merge.
+
+    Module-level (not a method) because multiprocessing pickles the callable
+    by reference -- a bound method or closure can't cross the process
+    boundary. Returns plain picklable types only (lists, bytes, ndarrays),
+    never an InvertedIndex or a Cython object.
+    """
+    (corpus_path, byte_start, byte_end, doc_id_start, min_token_len,
+     max_token_len, stem_tokens, prefix_tokens) = args
+    from submission import _fastbuild as fb  # re-imported: fresh process
+
+    builder = fb.Builder(min_token_len, max_token_len, stem_tokens)
+    doc_ids: List[str] = []
+    doc_lens: List[int] = []
+    with open(corpus_path, "rb") as f:
+        f.seek(byte_start)
+        internal_id = doc_id_start
+        while f.tell() < byte_end:
+            raw = f.readline()
+            line = raw.decode("utf-8").strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            doc_ids.append(obj["doc_id"])
+            doc_lens.append(builder.add_document(
+                obj["text"].lower().encode("utf-8"), internal_id, prefix_tokens))
+            internal_id += 1
+
+    terms_unsorted = builder.terms()
+    if not terms_unsorted:
+        return doc_ids, doc_lens, [], np.zeros(0, dtype=np.int64), \
+            np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+
+    # Identity order: local postings come back in first-seen (unsorted) term
+    # order. The merge step below does the real sort once, globally, rather
+    # than sorting per worker and re-sorting again after the union.
+    identity = np.arange(len(terms_unsorted), dtype=np.int32)
+    docs_arr, tfs_arr, df = builder.finish_sorted(identity)
+    return doc_ids, doc_lens, terms_unsorted, docs_arr, tfs_arr, df
 
 
 class InvertedIndex:
@@ -163,6 +251,129 @@ class InvertedIndex:
         if _FASTBUILD is not None and _FASTBUILD.Builder.supports(self.config):
             return self._build_counts_fast(docs)
         return self._build_counts(docs)
+
+    def build_from_jsonl_parallel(self, corpus_path: str, prefix_tokens: int = -1,
+                                  n_workers: Optional[int] = None,
+                                  min_docs: int = _PARALLEL_MIN_DOCS) -> bool:
+        """Split the corpus across up to `n_workers` processes for the
+        per-document tokenise/stem/intern phase. Returns True if it ran (the
+        parallel path was applicable), False if the caller should fall back
+        to `build_from_jsonl()` -- e.g. the C++ builder can't reproduce this
+        analysis chain, or the corpus is too small for splitting to pay for
+        its own overhead.
+
+        Only tokenisation is parallel; postings assembly, encoding and disk
+        writes stay serial regardless (a global, whole-collection step by
+        nature), so this is bounded by Amdahl's law, not a 4x build-time cut.
+        """
+        self._prefix_tokens = prefix_tokens
+        if _FASTBUILD is None or not _FASTBUILD.Builder.supports(self.config):
+            return False
+        if self.store_positions or self.store_forward:
+            return False  # not supported by the fast path at all, parallel or not
+
+        n_workers = n_workers or os.cpu_count() or 1
+        size = os.path.getsize(corpus_path)
+        approx_docs = size // 200  # ~200 bytes/doc average on this corpus; a
+        # cheap upper-bound estimate to gate on, not an exact count -- getting
+        # this wrong only costs "did we parallelise a corpus that was too
+        # small to benefit", never correctness.
+        if n_workers < 2 or approx_docs < min_docs:
+            return False
+
+        ranges = _split_byte_ranges(corpus_path, n_workers)
+        tasks = [(corpus_path, start, end, doc_id_start,
+                 self.config.min_token_len, self.config.max_token_len,
+                 self.config.stemmer == "porter", prefix_tokens)
+                for start, end, doc_id_start in ranges]
+
+        ctx = multiprocessing.get_context("spawn")  # portable; fork is unsafe
+        # to rely on once the parent has imported a compiled extension.
+        with ctx.Pool(processes=n_workers) as pool:
+            results = pool.map(_parallel_build_worker, tasks)
+
+        self._merge_parallel_results(results)
+        return True
+
+    def _merge_parallel_results(self, results) -> None:
+        """Union each worker's local vocabulary into one global sorted one,
+        remap postings, and concatenate per term in worker-rank order.
+
+        Concatenation (not a k-way merge) is correct because each worker's
+        doc-id range is contiguous, non-overlapping, and increases with
+        worker rank -- worker 0's documents all precede worker 1's, etc. --
+        so a term's postings are already doc-id-ascending within one worker
+        and stay ascending when workers are joined in rank order.
+        """
+        doc_ids: List[str] = []
+        doc_lens: List[int] = []
+        for w_doc_ids, w_doc_lens, _terms, _d, _t, _df in results:
+            doc_ids.extend(w_doc_ids)
+            doc_lens.extend(w_doc_lens)
+
+        self.doc_ids = doc_ids
+        self.doc_len = np.array(doc_lens, dtype=np.int64)
+        self.N = len(doc_ids)
+        self.total_tokens = int(self.doc_len.sum()) if self.N else 0
+        self.avg_doc_len = (self.total_tokens / self.N) if self.N else 0.0
+
+        all_terms = set()
+        for _di, _dl, terms, _d, _t, _df in results:
+            all_terms.update(terms)
+        if not all_terms:
+            self._finalise_empty({})
+            return
+
+        sorted_terms = sorted(all_terms)
+        global_index = {t: i for i, t in enumerate(sorted_terms)}
+        n_global = len(sorted_terms)
+
+        # Per worker: local term_start offsets (into its own docs/tfs arrays)
+        # and local-index -> global-index, so a global term's contribution
+        # from this worker can be sliced out directly.
+        per_worker = []
+        for _di, _dl, terms, docs_arr, tfs_arr, df in results:
+            local_start = self._term_starts(df) if df.size else np.zeros(0, dtype=np.int64)
+            g_of_l = np.fromiter((global_index[t] for t in terms), dtype=np.int64,
+                                 count=len(terms))
+            per_worker.append((docs_arr, tfs_arr, df, local_start, g_of_l))
+
+        docs_chunks: List[np.ndarray] = []
+        tfs_chunks: List[np.ndarray] = []
+        df_final = np.zeros(n_global, dtype=np.int64)
+        # Global-to-local lookup per worker (-1 = this worker never saw the
+        # term), built once so the term loop below is O(1) per worker.
+        inv_maps = []
+        for docs_arr, tfs_arr, df, local_start, g_of_l in per_worker:
+            inv = np.full(n_global, -1, dtype=np.int64)
+            if g_of_l.size:
+                inv[g_of_l] = np.arange(g_of_l.size, dtype=np.int64)
+            inv_maps.append(inv)
+
+        for g in range(n_global):
+            for (docs_arr, tfs_arr, df, local_start, _g_of_l), inv in zip(per_worker, inv_maps):
+                l = inv[g]
+                if l < 0:
+                    continue
+                s = int(local_start[l])
+                e = s + int(df[l])
+                docs_chunks.append(docs_arr[s:e])
+                tfs_chunks.append(tfs_arr[s:e])
+                df_final[g] += (e - s)
+
+        docs_arr = (np.concatenate(docs_chunks) if docs_chunks
+                   else np.zeros(0, dtype=np.int64))
+        tfs_arr = (np.concatenate(tfs_chunks) if tfs_chunks
+                  else np.zeros(0, dtype=np.int64))
+
+        self.terms = sorted_terms
+        self.term_lookup = global_index
+        self.df = df_final
+        self.cf = np.zeros(n_global, dtype=np.int64)
+        if docs_arr.size:
+            np.add.reduceat(tfs_arr.astype(np.int64), self._term_starts(df_final),
+                            out=self.cf)
+        self._encode_postings(docs_arr.astype(np.int64), tfs_arr.astype(np.int64))
 
     def _build_counts_fast(self, docs: Iterable[Tuple[str, str]]) -> None:
         """Same index as `_build_counts`, with tokenising and posting emission

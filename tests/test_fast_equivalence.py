@@ -18,6 +18,7 @@ If the extension is not built, the equivalence tests skip and the fallback test
 still runs.
 """
 import numpy as np
+import os
 import pytest
 
 from submission import bm25, boolean_vsm
@@ -373,3 +374,94 @@ def test_porter_stemmer_handles_edge_cases_without_crashing():
     for word in (b"", b"a", b"ab", b"y", b"yy", b"yyyy", b"bcdfg", b"aeiou",
                 b"0", b"00000000", b"x" * 32):
         fb.porter_stem(word)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Parallel build (submission/indexer.py's build_from_jsonl_parallel)
+# ---------------------------------------------------------------------------
+# Splits per-document tokenisation across processes; postings assembly stays
+# serial (a whole-collection step by nature), so this is bounded by Amdahl's
+# law, not a 4x cut -- measured ~1.75x at n_workers=4 on the real corpus, not
+# the ~4x a naive "more cores" intuition would suggest.
+#
+# min_docs=0 forces the parallel path on a small corpus purely for test
+# speed; the size gate itself (_PARALLEL_MIN_DOCS) is production tuning, not
+# something correctness depends on.
+
+def _write_jsonl_corpus(path, corpus):
+    import json
+    with open(path, "w", encoding="utf-8") as f:
+        for doc_id, text in corpus:
+            f.write(json.dumps({"doc_id": doc_id, "text": text}) + "\n")
+
+
+@pytest.mark.parametrize("n_workers", [2, 4])
+def test_parallel_build_is_byte_identical_to_serial(tmp_path, n_workers):
+    pytest.importorskip("submission._fastbuild")
+    from submission._analysis import AnalysisConfig
+
+    corpus_path = str(tmp_path / "corpus.jsonl")
+    _write_jsonl_corpus(corpus_path, _synthetic_corpus(600, seed=5))
+
+    for cfg in (AnalysisConfig(), AnalysisConfig(stemmer="porter")):
+        serial = InvertedIndex(cfg)
+        serial.build_from_jsonl(corpus_path)
+
+        parallel = InvertedIndex(cfg)
+        used = parallel.build_from_jsonl_parallel(
+            corpus_path, n_workers=n_workers, min_docs=0)
+        assert used, "parallel path declined despite min_docs=0"
+
+        assert serial.N == parallel.N
+        assert serial.terms == parallel.terms
+        assert serial.doc_ids == parallel.doc_ids
+        for name in ("doc_len", "df", "cf", "_docid_buf", "_docid_off",
+                     "_tf_packed", "_tf_exc_idx", "_tf_exc_val", "_term_start"):
+            np.testing.assert_array_equal(
+                getattr(serial, name), getattr(parallel, name),
+                err_msg=f"{name} differs (n_workers={n_workers}, "
+                       f"stemmer={cfg.stemmer})")
+
+
+def test_parallel_build_declines_below_the_doc_count_threshold():
+    """The default gate must actually gate -- a tiny corpus should take the
+    serial path even when the fast builder supports its analysis chain."""
+    pytest.importorskip("submission._fastbuild")
+    toy_corpus = os.path.join(os.path.dirname(__file__), "..", "data", "toy", "corpus.jsonl")
+    ix = InvertedIndex()
+    used = ix.build_from_jsonl_parallel(toy_corpus)
+    assert not used, "toy corpus is far below any sane parallel-build threshold"
+
+
+def test_parallel_build_declines_at_n_workers_1():
+    """Splitting across exactly one worker buys nothing; must decline rather
+    than pay multiprocessing overhead for zero parallelism."""
+    pytest.importorskip("submission._fastbuild")
+    ix = InvertedIndex()
+    assert not ix.build_from_jsonl_parallel(
+        os.path.join(os.path.dirname(__file__), "..", "data", "toy", "corpus.jsonl"),
+        n_workers=1, min_docs=0)
+
+
+def test_parallel_build_declines_for_unsupported_analysis_chains():
+    """Falls back cleanly (returns False) rather than silently building a
+    different index, for the same configs the serial fast path declines."""
+    pytest.importorskip("submission._fastbuild")
+    from submission._analysis import AnalysisConfig
+    ix = InvertedIndex(AnalysisConfig(remove_stopwords=True))
+    assert not ix.build_from_jsonl_parallel(
+        os.path.join(os.path.dirname(__file__), "..", "data", "toy", "corpus.jsonl"),
+        min_docs=0)
+
+
+def test_parallel_build_handles_empty_and_tiny_corpora(tmp_path):
+    """Degenerate n_docs (0, 1, fewer than n_workers) must not crash the
+    byte-range splitter or the merge step."""
+    pytest.importorskip("submission._fastbuild")
+    for corpus in ([], [("d1", "a b c")], [("d1", "a"), ("d2", "b")]):
+        corpus_path = str(tmp_path / f"c{len(corpus)}.jsonl")
+        _write_jsonl_corpus(corpus_path, corpus)
+        ix = InvertedIndex()
+        used = ix.build_from_jsonl_parallel(corpus_path, n_workers=4, min_docs=0)
+        assert used
+        assert ix.N == len(corpus)

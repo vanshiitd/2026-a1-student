@@ -4,15 +4,15 @@
   "num_queries_scored": 6,
   "skipped_no_qrels": [],
   "aggregate_metrics": {
-    "ndcg@10": 0.87326027942385,
-    "map@10": 0.8611111111111112,
+    "ndcg@10": 0.8736429521311136,
+    "map@10": 0.8666666666666667,
     "mrr": 1.0,
     "p@10": 0.35000000000000003
   },
   "leaderboard": {
-    "ndcg@10": 0.87326027942385,
-    "map@10": 0.8611111111111112,
-    "provisional_score_80pct": 0.6973933067078061,
+    "ndcg@10": 0.8736429521311136,
+    "map@10": 0.8666666666666667,
+    "provisional_score_80pct": 0.6982167331584462,
     "note": "This is nDCG@10 and MAP@10 combined at their 70%/10% weights (80% of the total). The remaining \u00b110% efficiency modifier and 0-10% index-size score are both computed relative to the whole class and are applied when course staff aggregate the real leaderboard.",
     "baseline_ndcg@10": 0.862480709374298,
     "baseline_map@10": 0.6836309523809524,
@@ -20,11 +20,11 @@
     "beats_baseline_map@10": true
   },
   "efficiency": {
-    "index_build_seconds": 0.3269893330289051,
-    "index_load_seconds": 0.0007910421118140221,
+    "index_build_seconds": 0.003385875024832785,
+    "index_load_seconds": 0.0007754589896649122,
     "index_size_bytes": 2349,
-    "mean_query_latency_seconds": 0.05404827784514055,
-    "max_query_latency_seconds": 0.32361225003842264
+    "mean_query_latency_seconds": 0.05603806251504769,
+    "max_query_latency_seconds": 0.3355527500389144
   },
   "per_query_metrics": {
     "q1": {
@@ -35,8 +35,8 @@
       "num_ranked": 10
     },
     "q2": {
-      "ndcg@10": 0.8445762610685551,
-      "map@10": 0.9166666666666666,
+      "ndcg@10": 0.8468722973121366,
+      "map@10": 0.95,
       "mrr": 1.0,
       "p@10": 0.4,
       "num_ranked": 10

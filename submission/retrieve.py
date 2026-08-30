@@ -71,9 +71,19 @@ def build_index(corpus_path: str, index_dir: str) -> None:
         _build_index_shipped(corpus_path, index_dir)
 
 
+def _build(index: InvertedIndex, corpus_path: str, prefix_tokens: int = -1) -> None:
+    """Build one index, splitting tokenisation across the grading machine's
+    cores when it's worth it (index.build_from_jsonl_parallel() declines and
+    returns False for small corpora or unsupported analysis chains -- the
+    serial build_from_jsonl() below is the fallback, not a separate path
+    that can drift from it)."""
+    if not index.build_from_jsonl_parallel(corpus_path, prefix_tokens=prefix_tokens):
+        index.build_from_jsonl(corpus_path, prefix_tokens=prefix_tokens)
+
+
 def _build_index_shipped(corpus_path: str, index_dir: str) -> None:
     index = InvertedIndex()
-    index.build_from_jsonl(corpus_path)
+    _build(index, corpus_path)
     index.save(os.path.join(index_dir, _MAIN_DIR))
 
     # Pseudo-title field: same corpus, first TITLE_WIDTH tokens only. It shares
@@ -81,7 +91,7 @@ def _build_index_shipped(corpus_path: str, index_dir: str) -> None:
     # the external doc-id strings.
     title = InvertedIndex()
     title.store_doc_ids = False
-    title.build_from_jsonl(corpus_path, prefix_tokens=TITLE_WIDTH)
+    _build(title, corpus_path, prefix_tokens=TITLE_WIDTH)
     title.save(os.path.join(index_dir, _TITLE_DIR))
 
 
@@ -98,12 +108,12 @@ def _build_index_rm3_stemmed(corpus_path: str, index_dir: str) -> None:
     cfg = AnalysisConfig(stemmer="porter")
 
     body = InvertedIndex(cfg)
-    body.build_from_jsonl(corpus_path)
+    _build(body, corpus_path)
     body.save(os.path.join(index_dir, _MAIN_DIR))
 
     title = InvertedIndex(cfg)
     title.store_doc_ids = False
-    title.build_from_jsonl(corpus_path, prefix_tokens=TITLE_WIDTH)
+    _build(title, corpus_path, prefix_tokens=TITLE_WIDTH)
     title.save(os.path.join(index_dir, _TITLE_DIR))
 
 
