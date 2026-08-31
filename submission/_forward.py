@@ -51,19 +51,39 @@ class ForwardIndex:
         `term_ids` must already be the InvertedIndex's final (sorted-vocabulary)
         ids -- this class does not assign or remap term ids itself.
         """
-        fwd = cls()
-        fwd.N = n_docs
         if doc_ids.size == 0:
+            fwd = cls()
+            fwd.N = n_docs
             fwd._doc_off = np.zeros(n_docs + 1, dtype=np.int64)
             fwd._termid_off = np.zeros(n_docs + 1, dtype=np.int64)
             return fwd
 
         order = np.lexsort((term_ids, doc_ids))  # sort by doc, term ascending within
-        d = doc_ids[order]
-        t = term_ids[order].astype(np.int64)
-        f = tfs[order]
+        d, t, f = doc_ids[order], term_ids[order], tfs[order]
+        del order
+        return cls._build_sorted(d, t, f, n_docs)
+
+    @classmethod
+    def _build_sorted(cls, d: np.ndarray, t: np.ndarray, f: np.ndarray,
+                      n_docs: int) -> "ForwardIndex":
+        """Shared tail of `build()`, taking (doc, term, tf) already sorted by
+        (doc ascending, term ascending).
+
+        Split out so `from_body_index()` can free its own unsorted (doc_ids,
+        term_ids, tfs) right after sorting -- before calling into here -- so
+        the peak is "sorted copies only", not "unsorted plus sorted at once".
+        A plain `build()` call can't do that itself: its unsorted arguments
+        stay alive in the *caller's* frame for `build()`'s entire duration
+        regardless of what `build()` does internally, since Python keeps a
+        suspended frame's locals alive until it resumes. (F51 in notes/findings.md
+        measured this: at 4x the dev corpus, load-time peak memory hit 9.59GB,
+        already over the grading machine's 8GB.)
+        """
+        fwd = cls()
+        fwd.N = n_docs
 
         counts = np.bincount(d, minlength=n_docs).astype(np.int64)
+        del d
         doc_off = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)
         fwd._doc_off = doc_off
 
@@ -71,15 +91,21 @@ class ForwardIndex:
         # `starts` filters out empty documents: without that, a run of empty
         # documents at the end of the corpus would index past the array.
         starts = doc_off[:-1][counts > 0]
-        gaps = np.empty(t.size, dtype=np.int64)
+        # int32, not int64: a term-id delta is bounded by the vocabulary size,
+        # nowhere near int32's ~2.1 billion ceiling even at the "larger
+        # collection" scale the held-out evaluation uses (assignment1.tex
+        # Sec. 3). Halves this array next to the original int64 version.
+        n_postings = t.size
+        gaps = np.empty(n_postings, dtype=np.int32)
         gaps[0] = t[0]
         np.subtract(t[1:], t[:-1], out=gaps[1:])
         gaps[starts] = t[starts]
+        del t
 
         # Unlike terms (df is always >= 1), documents can legitimately be
         # empty -- this corpus has 8 (notes/findings.md F2). A trailing empty
-        # document makes doc_off[:-1] contain t.size itself, which is out of
-        # bounds for reduceat.
+        # document makes doc_off[:-1] contain n_postings itself, which is out
+        # of bounds for reduceat.
         #
         # CLAMPING an out-of-bounds start (rather than dropping it) was tried
         # and is wrong: reduceat uses the NEXT index as an implicit end
@@ -90,7 +116,7 @@ class ForwardIndex:
         # end of the array, which is exactly correct when what follows is
         # only trailing empty documents.
         starts_all = doc_off[:-1]
-        in_bounds = starts_all < t.size
+        in_bounds = starts_all < n_postings
         termid_bytes = np.zeros(n_docs, dtype=np.int64)
         if in_bounds.any():
             termid_bytes[in_bounds] = np.add.reduceat(vbyte_widths(gaps), starts_all[in_bounds])
@@ -124,16 +150,30 @@ class ForwardIndex:
                              np.zeros(0, dtype=np.int64), index.N)
 
         gaps = vbyte_decode(index._docid_buf, total)
+        # int32: doc ids are bounded by index.N, nowhere near int32's ~2.1
+        # billion ceiling. cumsum's own dtype= avoids ever materialising an
+        # int64 version of this array at all.
+        running = np.cumsum(gaps, dtype=np.int32)
+        del gaps
         starts = index._term_start
-        running = np.cumsum(gaps)
-        base = np.zeros(starts.size, dtype=np.int64)
+        base = np.zeros(starts.size, dtype=np.int32)
         if starts.size > 1:
             base[1:] = running[starts[1:] - 1]
         doc_ids = running - np.repeat(base, index.df)
-        term_ids = np.repeat(np.arange(n_terms, dtype=np.int64), index.df)
+        del running, base
+        term_ids = np.repeat(np.arange(n_terms, dtype=np.int32), index.df)
         tfs = unpack_tf_nibbles(index._tf_packed, 0, total,
-                                index._tf_exc_idx, index._tf_exc_val)
-        return cls.build(doc_ids, term_ids, tfs, index.N)
+                                index._tf_exc_idx, index._tf_exc_val).astype(np.int32)
+
+        # Sort and free the unsorted triples in *this* frame rather than
+        # handing them to build(): a suspended frame's locals stay alive for
+        # the whole duration of a call it made, so passing unsorted arrays
+        # into build() would keep both the unsorted and the sorted copies
+        # alive simultaneously for no reason (F51, notes/findings.md).
+        order = np.lexsort((term_ids, doc_ids))
+        d, t, f = doc_ids[order], term_ids[order], tfs[order]
+        del doc_ids, term_ids, tfs, order
+        return cls._build_sorted(d, t, f, index.N)
 
     # ------------------------------------------------------------------
     # Query

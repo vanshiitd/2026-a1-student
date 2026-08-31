@@ -95,11 +95,20 @@ def _expanded(index):
         total = int(index.df.sum())
         gaps = vbyte_decode(index._docid_buf, total)
         starts = index._term_start
-        running = np.cumsum(gaps)
-        base = np.zeros(starts.size, dtype=np.int64)
+        # int32, not int64: doc ids are bounded by index.N, nowhere near
+        # int32's ~2.1 billion ceiling even at the "larger collection" scale
+        # the held-out evaluation uses (assignment1.tex Sec. 3). cumsum's own
+        # dtype= avoids ever materialising an int64 `running` at all -- this
+        # ran at load time for BOTH strategies (rm3.build() calls _expanded()
+        # directly too), so it was a shared bottleneck, not RM3-specific
+        # (F51/F52, notes/findings.md).
+        running = np.cumsum(gaps, dtype=np.int32)
+        del gaps
+        base = np.zeros(starts.size, dtype=np.int32)
         if starts.size > 1:
             base[1:] = running[starts[1:] - 1]
-        docids = (running - np.repeat(base, index.df)).astype(np.int32)
+        docids = running - np.repeat(base, index.df)  # already int32
+        del running, base
         tfs = unpack_tf_nibbles(index._tf_packed, 0, total,
                                 index._tf_exc_idx, index._tf_exc_val).astype(np.uint16)
         cached = (docids, tfs)

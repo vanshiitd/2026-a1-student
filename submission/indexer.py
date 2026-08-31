@@ -167,8 +167,13 @@ def _parallel_build_worker(args):
 
     terms_unsorted = builder.terms()
     if not terms_unsorted:
-        return doc_ids, doc_lens, [], np.zeros(0, dtype=np.int64), \
-            np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+        # int32 for docs/tfs, matching finish_sorted()'s normal-case dtype
+        # (_fastbuild.pyx) -- np.concatenate upcasts its whole result to
+        # int64 if even one chunk in the list doesn't match, which would
+        # silently defeat _merge_parallel_results()'s int32 path whenever a
+        # worker's byte range happened to be empty.
+        return doc_ids, doc_lens, [], np.zeros(0, dtype=np.int32), \
+            np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int64)
 
     # Identity order: local postings come back in first-seen (unsorted) term
     # order. The merge step below does the real sort once, globally, rather
@@ -361,19 +366,28 @@ class InvertedIndex:
                 tfs_chunks.append(tfs_arr[s:e])
                 df_final[g] += (e - s)
 
+        # int32, matching finish_sorted()'s own return dtype (_fastbuild.pyx):
+        # docs_chunks/tfs_chunks are views into each worker's int32 arrays, so
+        # concatenating them is already int32 in the common case; only the
+        # dtype= here matters for the (unreachable in practice -- all_terms
+        # non-empty implies at least one chunk) empty fallback, kept
+        # consistent so concatenate never has to upcast the real case to
+        # match a mismatched empty-array dtype.
         docs_arr = (np.concatenate(docs_chunks) if docs_chunks
-                   else np.zeros(0, dtype=np.int64))
+                   else np.zeros(0, dtype=np.int32))
         tfs_arr = (np.concatenate(tfs_chunks) if tfs_chunks
-                  else np.zeros(0, dtype=np.int64))
+                  else np.zeros(0, dtype=np.int32))
 
         self.terms = sorted_terms
         self.term_lookup = global_index
         self.df = df_final
         self.cf = np.zeros(n_global, dtype=np.int64)
         if docs_arr.size:
-            np.add.reduceat(tfs_arr.astype(np.int64), self._term_starts(df_final),
-                            out=self.cf)
-        self._encode_postings(docs_arr.astype(np.int64), tfs_arr.astype(np.int64))
+            # reduceat's out= safely upcasts int32 -> int64 during
+            # accumulation; casting the input first would just allocate a
+            # redundant total-postings-sized copy (F51, notes/findings.md).
+            np.add.reduceat(tfs_arr, self._term_starts(df_final), out=self.cf)
+        self._encode_postings(docs_arr, tfs_arr)
 
     def _build_counts_fast(self, docs: Iterable[Tuple[str, str]]) -> None:
         """Same index as `_build_counts`, with tokenising and posting emission
@@ -416,8 +430,12 @@ class InvertedIndex:
         self.term_lookup = {term: i for i, term in enumerate(sorted_terms)}
         self.df = df
         self.cf = np.zeros(len(sorted_terms), dtype=np.int64)
-        np.add.reduceat(tfs_arr.astype(np.int64), self._term_starts(df), out=self.cf)
-        self._encode_postings(docs_arr.astype(np.int64), tfs_arr.astype(np.int64))
+        # docs_arr/tfs_arr come back from finish_sorted() as int32 already
+        # (submission/_fastbuild.pyx); reduceat's out= safely upcasts during
+        # accumulation, so casting the input up first would only allocate a
+        # redundant total-postings-sized int64 copy for no benefit (F51).
+        np.add.reduceat(tfs_arr, self._term_starts(df), out=self.cf)
+        self._encode_postings(docs_arr, tfs_arr)
 
     @staticmethod
     def _term_starts(df: np.ndarray) -> np.ndarray:
@@ -432,7 +450,12 @@ class InvertedIndex:
         """Delta+VByte encode postings that are already grouped by term and
         ascending by doc id within each term."""
         term_start = self._term_starts(self.df)
-        gaps = np.empty(post_doc.size, dtype=np.int64)
+        # int32, not int64: a doc-id delta is bounded by self.N, nowhere near
+        # int32's ~2.1 billion ceiling even at the "larger collection" scale
+        # the held-out evaluation uses (assignment1.tex Sec. 3). This is a
+        # total-postings-sized array (16.3M+ at the dev corpus), so this is
+        # the single biggest lever in this function (see F51, notes/findings.md).
+        gaps = np.empty(post_doc.size, dtype=np.int32)
         gaps[0] = post_doc[0]
         np.subtract(post_doc[1:], post_doc[:-1], out=gaps[1:])
         gaps[term_start] = post_doc[term_start]
