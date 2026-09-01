@@ -135,6 +135,30 @@ def _split_byte_ranges(corpus_path: str, n_workers: int):
     return ranges
 
 
+def _detected_worker_count() -> int:
+    """Best-effort process-visible CPU count, capped defensively.
+
+    os.cpu_count() reports the HOST's total CPU count, even inside a
+    container whose actual allocation is far smaller -- the grading machine
+    is documented as 4 cores (assignment1.tex Sec. 5), but a real grading
+    run's error log showed OpenBLAS sizing ITS OWN thread pool to 28 (see
+    _detected_worker_count()'s caller): the host's count, not the
+    container's. os.sched_getaffinity(0), where available, respects the
+    process's actual CPU affinity mask, which container CPU limits
+    typically DO set correctly; os.cpu_count() is the fallback where
+    sched_getaffinity doesn't exist (e.g. macOS has no such call). Clamped
+    regardless: this project's own build-time measurements
+    (notes/findings.md) show throughput saturating well under 8 workers, so
+    trusting a much larger raw count buys nothing and only raises the odds
+    of hitting a process/thread ceiling like the one below.
+    """
+    try:
+        n = len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+    except AttributeError:
+        n = os.cpu_count() or 1
+    return max(1, min(n, 8))
+
+
 def _parallel_build_worker(args):
     """Runs in a separate process: tokenise/stem/intern one byte range of the
     corpus with its own local Builder, return everything needed to merge.
@@ -277,7 +301,7 @@ class InvertedIndex:
         if self.store_positions or self.store_forward:
             return False  # not supported by the fast path at all, parallel or not
 
-        n_workers = n_workers or os.cpu_count() or 1
+        n_workers = n_workers or _detected_worker_count()
         size = os.path.getsize(corpus_path)
         approx_docs = size // 200  # ~200 bytes/doc average on this corpus; a
         # cheap upper-bound estimate to gate on, not an exact count -- getting
@@ -291,6 +315,25 @@ class InvertedIndex:
                  self.config.min_token_len, self.config.max_token_len,
                  self.config.stemmer == "porter", prefix_tokens)
                 for start, end, doc_id_start in ranges]
+
+        # Each spawned worker re-imports numpy fresh (spawn re-imports
+        # everything), and numpy's BLAS backend sizes ITS OWN internal
+        # thread pool from the visible CPU count too -- with n_workers
+        # processes each also spinning up that many BLAS threads, a real
+        # grading run hit `pthread_create failed ... Resource temporarily
+        # unavailable` inside OpenBLAS's own init, partway through numpy's
+        # import, before any of this project's code had run at all.
+        # Multiprocessing is already the parallelism here; BLAS threading
+        # inside each worker is pure redundant oversubscription on top of
+        # it. Setting these here, in the parent, propagates through
+        # process creation to each child's environment (spawn inherits the
+        # environment at Process-creation time) without affecting the
+        # BLAS thread pool this process itself already initialised when it
+        # first imported numpy -- that's sized once, at import time, so a
+        # later env var change here has no retroactive effect on it.
+        for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS",
+                    "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            os.environ[_var] = "1"
 
         ctx = multiprocessing.get_context("spawn")  # portable; fork is unsafe
         # to rely on once the parent has imported a compiled extension.
