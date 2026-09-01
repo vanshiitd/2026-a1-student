@@ -1,8 +1,10 @@
-# Pinned, minimal image so the grading harness runs your submission
-# identically regardless of local setup (assignment Section 5,
-# "Containerisation"). Course staff run every submission through this
-# same image at grading time.
-FROM python:3.11-slim
+# Pinned, minimal image so local testing matches the grading machine's
+# toolchain (assignment Section 5, "Containerisation": Ubuntu 24.04.3 LTS,
+# Python 3.12.3, GCC/G++ 13.3.0). Course staff never build or run this
+# Dockerfile itself for scoring -- their own separate image copies in only
+# submission/ (see docs/DOCKER_SUBMISSION.md) -- this is purely so `docker
+# build . && docker run` gives you a representative local check.
+FROM python:3.12-slim
 
 WORKDIR /repo
 
