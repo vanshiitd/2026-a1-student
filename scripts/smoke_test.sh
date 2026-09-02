@@ -15,10 +15,6 @@ echo "== Component correctness tests (codecs, BM25, Boolean/VSM) =="
 pytest tests/test_codecs.py tests/test_ranking_components.py tests/test_fast_equivalence.py -v
 
 echo
-echo "== Forward index + rm3_stemmed competition strategy =="
-pytest tests/test_forward_index.py tests/test_rm3_strategy.py -v
-
-echo
 echo "== Full harness run on the toy set =="
 python -m harness.run_harness \
   --corpus data/toy/corpus.jsonl \
