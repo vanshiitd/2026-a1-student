@@ -24,10 +24,15 @@ from submission.indexer import InvertedIndex
 #
 # "rm3_stemmed": pseudo-relevance feedback over a stemmed body + title.
 # Honest CV: +0.0392 nDCG@10, p=0.084 -- above shipped's own dev estimate but
-# short of the p<0.05 bar everything else here cleared. Currently shipping to
-# get an unbiased read against the private held-out topics; see notes/findings.md
-# F30/F37/F40/F41 for what's been tried to firm this up (nothing has, yet).
-ACTIVE_STRATEGY = "rm3_stemmed"  # "shipped" | "rm3_stemmed"
+# short of the p<0.05 bar everything else here cleared. Shipped through Day 4
+# of the competition round to get an unbiased read against the private
+# held-out topics -- that read came back: rm3_stemmed placed near the bottom
+# of the class (nDCG@10 0.1714 vs the class's 0.17-0.23 band, Day 4 leaderboard),
+# a result consistent with RM3's own weakest point in F49's 5-collection test
+# (it lost to shipped specifically on FiQA, the one structurally-mismatched
+# dataset) and with its dev-set edge never clearing p<0.05 in the first place.
+# Switched back to shipped for the remainder of the round on that evidence.
+ACTIVE_STRATEGY = "shipped"  # "shipped" | "rm3_stemmed"
 
 # k1=4.5, b=0.60. Textbook defaults are 1.2/0.75. Picked by smoothed-surface
 # argmax over an 840-point grid, honest CV +0.066 nDCG@10 vs defaults (p=0.0002).

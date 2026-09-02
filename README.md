@@ -9,54 +9,55 @@ Two ranking strategies are fully implemented; `submission/retrieve.py`'s
 independently tested regardless of which is active — switching is a one-line
 change, not a redeploy.
 
-**Currently shipped: `"rm3_stemmed"`** — BM25 with pseudo-relevance feedback
-(RM3) over a stemmed analysis chain plus a stemmed pseudo-title field. Full
-methodology, the parameter search, and every technique tried and rejected
-along the way are in the accompanying report, submitted separately.
+**Currently shipped: `"shipped"`** — plain BM25 (`k1=4.5, b=0.60`) plus an
+unstemmed pseudo-title field, no feedback pass. Full methodology, the
+parameter search, and every technique tried and rejected along the way are
+in the accompanying report, submitted separately.
 
 | | dev set (50 topics, 171,332 docs) |
 |---|---|
-| nDCG@10 | **0.6837** |
-| MAP@10 | 0.0172 *(ceiling on this collection is ~0.027 — see the report)* |
-| MRR / P@10 | 0.8583 / 0.7700 |
-| Index size | **21.5 MB** |
-| Index build | 2.7 s *(4 cores; ~4.4s on 1)* |
-| Index load | ~2 s |
-| Query latency | ~2.5 ms mean |
+| nDCG@10 | **0.6395** |
+| MAP@10 | 0.0143 |
+| MRR / P@10 | 0.8839 / 0.6960 |
+| Index size | **22.8 MB** *(23,957,106 bytes; no forward index)* |
+| Index build | 2.6 s *(4 cores)* |
+| Index load | ~0.5 s |
+| Query latency | ~0.7 ms mean |
 
-Three independent optimisations get RM3 here from an original 51MB / 24s
-build / 19ms query, with byte-identical retrieval quality confirmed at every
-step (nDCG@10/MAP@10/MRR/P@10 unchanged throughout):
+The alternative, `"rm3_stemmed"` (BM25 with pseudo-relevance feedback over a
+stemmed analysis chain plus a stemmed pseudo-title field), scores higher on
+the dev set (nDCG@10 0.6837 vs 0.6395), builds a comparably-sized index
+(21.5 MB), and was what actually shipped through Day 4 of the competition
+round as the held-out A/B this project's earlier notes flagged as pending.
+That read came back: RM3 placed near the bottom of the class on the private
+held-out topics (nDCG@10 0.1714, against the whole class's 0.17-0.23 band on
+Day 4) — a result consistent with RM3's own weakest point in the report's
+5-collection generalisation test (it lost to plain BM25 specifically on
+FiQA, the one structurally-mismatched dataset among the five) and with its
+dev-set advantage never clearing the p<0.05 significance bar this project
+holds every other change to (best honest estimate: p≈0.05–0.08 across four
+independent tests). Switched back to `"shipped"` for the remainder of the
+round on that evidence; `submission/retrieve.py`'s comment above
+`ACTIVE_STRATEGY` and the report cover the full trail.
+
+Three independent optimisations to RM3's own path (kept, and still exercised
+by `tests/test_rm3_strategy.py`, since switching strategies is a one-line
+change either way) got it from an original 51MB / 24s build / 19ms query to
+21.5MB / 2.7s / ~2.5ms, with byte-identical retrieval quality confirmed at
+every step:
 
 - **Forward index built in memory at load time**, not persisted. A
   document's handful of distinct terms scattered across the whole vocabulary
   compresses far worse than a term's postings across all documents, so
   persisting it cost ~30MB for no query-time benefit. Load time isn't a
-  graded efficiency metric, so this is a pure win, not a tradeoff: 51MB -> 21.5MB.
+  graded efficiency metric, so this is a pure win, not a tradeoff.
 - **A C++ port of NLTK's Porter stemmer** (verified against NLTK across all
   207,034 distinct tokens the corpus produces, not sampled), plus caching a
   dict that was being rebuilt from all 171K doc_ids on every query and
-  moving RM3's feedback-term aggregation into a small Cython kernel. Query
-  latency ~19ms -> ~11-13ms; a large share of build time moved from Python
-  to C++.
+  moving RM3's feedback-term aggregation into a small Cython kernel.
 - **Tokenisation split across the grading machine's 4 cores.** Gated behind
   a document-count threshold so small corpora take the serial path
-  automatically. Postings assembly and compression stay serial by nature
-  (Amdahl's law caps the achievable speedup here around 2x, not 4x), but
-  combined with the C++ stemmer this brings the full build to **2.7s**.
-
-The alternative, `"shipped"` (plain BM25, `k1=4.5, b=0.60`, plus an unstemmed
-pseudo-title field — no feedback pass), is slightly larger (23.96 MB, since
-it carries no forward index at all), builds in almost exactly the same time
-(2.9s), and still has lower query latency (0.65 ms vs RM3's ~2.5 ms — a much
-smaller gap than before RM3's own query-path fixes, since it has no feedback
-pass to run), and scores 0.6395 nDCG@10 on the same dev topics.
-RM3's dev-set advantage is real but has never crossed the p<0.05 significance
-bar this project holds every other change to (best honest estimate: p≈0.05–0.08
-across four independent tests) and has an
-unexplained asymmetric failure mode on a handful of topics. The report covers
-the full evidence trail behind shipping the higher-variance option anyway,
-and the held-out A/B plan resolving it during the competition round.
+  automatically.
 
 ---
 

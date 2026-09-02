@@ -3,9 +3,11 @@ tests/test_rm3_strategy.py — the rm3_stemmed strategy, and the switch that
 selects between it and the plain BM25 ("shipped") alternative.
 
 submission/retrieve.py's ACTIVE_STRATEGY is a one-line edit (see its
-module-level comment) -- currently rm3_stemmed, shipped for the 28 Aug
-initial submission; plain BM25 remains available as a same-topics comparison
-point for the competition round. The risk either way: a future change to
+module-level comment) -- rm3_stemmed shipped for the 28 Aug initial
+submission and through Day 4 of the competition round, then switched back to
+shipped (plain BM25) after rm3_stemmed placed near the bottom of the class on
+the private held-out topics; see the comment above ACTIVE_STRATEGY for the
+numbers. The risk either way: a future change to
 submission/rm3.py or submission/_forward.py could silently break the
 non-active strategy, and nothing would notice until someone actually flips
 the switch, under time pressure, with the private held-out topics on the line.
@@ -37,10 +39,11 @@ def test_committed_default_is_the_intended_strategy():
     """A guard against ACTIVE_STRATEGY drifting by accident, not a fixed
     opinion about which strategy should be active. Update the expected value
     alongside any deliberate switch -- don't just delete this."""
-    assert entry.ACTIVE_STRATEGY == "rm3_stemmed", (
-        "ACTIVE_STRATEGY is not 'rm3_stemmed' (shipped for the 28 Aug initial "
-        "submission). If this is a deliberate switch, update this test's "
-        "expected value alongside it."
+    assert entry.ACTIVE_STRATEGY == "shipped", (
+        "ACTIVE_STRATEGY is not 'shipped' (switched back from rm3_stemmed "
+        "after Day 4 of the competition round -- see the comment above "
+        "ACTIVE_STRATEGY in submission/retrieve.py). If this is a deliberate "
+        "switch, update this test's expected value alongside it."
     )
 
 
