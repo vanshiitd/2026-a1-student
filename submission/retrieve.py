@@ -8,31 +8,31 @@ The harness only calls these three functions (assignment Section 5):
     retrieve(query, k=10) -> List[Tuple[str, float]]
 
 Kept thin on purpose: indexing lives in indexer.py, scoring in bm25.py /
-boolean_vsm.py / rm3.py over the shared registry in _scorers.py.
+boolean_vsm.py over the shared registry in _scorers.py.
+
+BM25 + pseudo-title field, no feedback pass. +0.0114 nDCG@10, p=0.011, and a
+generalisation check (an independently-selected config on the other half of
+dev reproduces this score to 4 decimals).
+
+A pseudo-relevance-feedback (RM3) alternative was also built, tuned, and
+shipped through Day 4 of the competition round to get an unbiased read
+against the private held-out topics: honest CV had put it at +0.0392 nDCG@10,
+p=0.084 -- above this config's own dev estimate but short of the p<0.05 bar
+everything else here cleared. That held-out read came back negative -- RM3
+placed near the bottom of the class (nDCG@10 0.1714 vs the class's 0.17-0.23
+band, Day 4 leaderboard), consistent with its weakest point in a 5-collection
+generalisation test (it lost to this config specifically on FiQA, the one
+structurally-mismatched dataset) and with its dev-set edge never clearing
+p<0.05 in the first place. Reverted to this plain-BM25 config on that
+evidence and removed the RM3 code entirely rather than leave an inactive,
+untested path in the submission; the report covers the full trail.
 """
 import os
 import sys
 from typing import List, Optional, Tuple
 
-from submission import bm25, boolean_vsm, rm3
-from submission._analysis import AnalysisConfig
+from submission import bm25, boolean_vsm
 from submission.indexer import InvertedIndex
-
-# "shipped": BM25 + pseudo-title field. +0.0114 nDCG@10, p=0.011, and a
-# generalisation check (an independently-selected config on the other half of
-# dev reproduces this score to 4 decimals).
-#
-# "rm3_stemmed": pseudo-relevance feedback over a stemmed body + title.
-# Honest CV: +0.0392 nDCG@10, p=0.084 -- above shipped's own dev estimate but
-# short of the p<0.05 bar everything else here cleared. Shipped through Day 4
-# of the competition round to get an unbiased read against the private
-# held-out topics -- that read came back: rm3_stemmed placed near the bottom
-# of the class (nDCG@10 0.1714 vs the class's 0.17-0.23 band, Day 4 leaderboard),
-# a result consistent with RM3's own weakest point in F49's 5-collection test
-# (it lost to shipped specifically on FiQA, the one structurally-mismatched
-# dataset) and with its dev-set edge never clearing p<0.05 in the first place.
-# Switched back to shipped for the remainder of the round on that evidence.
-ACTIVE_STRATEGY = "shipped"  # "shipped" | "rm3_stemmed"
 
 # k1=4.5, b=0.60. Textbook defaults are 1.2/0.75. Picked by smoothed-surface
 # argmax over an 840-point grid, honest CV +0.066 nDCG@10 vs defaults (p=0.0002).
@@ -66,27 +66,8 @@ def build_index(corpus_path: str, index_dir: str) -> None:
 
     Streams the corpus rather than materialising it -- 171K documents / 16.3M
     postings won't fit in 8GB as a dict-of-dicts held in memory at once.
-    Builds only what ACTIVE_STRATEGY needs, since build time and index size
-    are both graded.
     """
     os.makedirs(index_dir, exist_ok=True)
-    if ACTIVE_STRATEGY == "rm3_stemmed":
-        _build_index_rm3_stemmed(corpus_path, index_dir)
-    else:
-        _build_index_shipped(corpus_path, index_dir)
-
-
-def _build(index: InvertedIndex, corpus_path: str, prefix_tokens: int = -1) -> None:
-    """Build one index, splitting tokenisation across the grading machine's
-    cores when it's worth it (index.build_from_jsonl_parallel() declines and
-    returns False for small corpora or unsupported analysis chains -- the
-    serial build_from_jsonl() below is the fallback, not a separate path
-    that can drift from it)."""
-    if not index.build_from_jsonl_parallel(corpus_path, prefix_tokens=prefix_tokens):
-        index.build_from_jsonl(corpus_path, prefix_tokens=prefix_tokens)
-
-
-def _build_index_shipped(corpus_path: str, index_dir: str) -> None:
     index = InvertedIndex()
     _build(index, corpus_path)
     index.save(os.path.join(index_dir, _MAIN_DIR))
@@ -100,26 +81,14 @@ def _build_index_shipped(corpus_path: str, index_dir: str) -> None:
     title.save(os.path.join(index_dir, _TITLE_DIR))
 
 
-def _build_index_rm3_stemmed(corpus_path: str, index_dir: str) -> None:
-    """Stemmed body and a stemmed title field. Scorer in submission/rm3.py.
-
-    The forward index RM3 needs is NOT built or persisted here -- it costs
-    ~30MB on disk (a document's ~150 scattered term ids across the whole
-    vocabulary delta-encode far worse than a term's postings across all
-    documents does), and build()/save() would also charge its construction
-    against the graded build-time metric. load_index() instead rebuilds it
-    in memory from the body's own postings, at load time, which is unscored.
-    """
-    cfg = AnalysisConfig(stemmer="porter")
-
-    body = InvertedIndex(cfg)
-    _build(body, corpus_path)
-    body.save(os.path.join(index_dir, _MAIN_DIR))
-
-    title = InvertedIndex(cfg)
-    title.store_doc_ids = False
-    _build(title, corpus_path, prefix_tokens=TITLE_WIDTH)
-    title.save(os.path.join(index_dir, _TITLE_DIR))
+def _build(index: InvertedIndex, corpus_path: str, prefix_tokens: int = -1) -> None:
+    """Build one index, splitting tokenisation across the grading machine's
+    cores when it's worth it (index.build_from_jsonl_parallel() declines and
+    returns False for small corpora or unsupported analysis chains -- the
+    serial build_from_jsonl() below is the fallback, not a separate path
+    that can drift from it)."""
+    if not index.build_from_jsonl_parallel(corpus_path, prefix_tokens=prefix_tokens):
+        index.build_from_jsonl(corpus_path, prefix_tokens=prefix_tokens)
 
 
 def load_index(index_dir: str) -> None:
@@ -127,13 +96,8 @@ def load_index(index_dir: str) -> None:
     global _INDEX
     _INDEX = InvertedIndex.load(os.path.join(index_dir, _MAIN_DIR))
     title = InvertedIndex.load(os.path.join(index_dir, _TITLE_DIR))
-    if ACTIVE_STRATEGY == "rm3_stemmed":
-        from submission._forward import ForwardIndex
-        _INDEX.forward = ForwardIndex.from_body_index(_INDEX)
-        rm3.build(_INDEX, title)
-    else:
-        bm25.build(_INDEX, title_index=title, title_weight=TITLE_WEIGHT)
-    # Boolean/VSM are required regardless of ACTIVE_STRATEGY.
+    bm25.build(_INDEX, title_index=title, title_weight=TITLE_WEIGHT)
+    # Boolean/VSM are required regardless of the ranking strategy.
     boolean_vsm.build(_INDEX)
 
 
@@ -149,10 +113,7 @@ def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
         )
 
     try:
-        if ACTIVE_STRATEGY == "rm3_stemmed":
-            results = rm3.score(query, k)
-        else:
-            results = bm25.score(query, k, k1=BM25_K1, b=BM25_B)
+        results = bm25.score(query, k, k1=BM25_K1, b=BM25_B)
     except Exception as exc:  # noqa: BLE001 - deliberate boundary guard
         # One malformed query shouldn't zero every topic: the harness reports
         # RUNTIME_ERROR and aborts the whole run on any exception out of

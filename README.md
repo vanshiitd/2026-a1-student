@@ -4,12 +4,7 @@ An inverted-index retrieval engine built from scratch (no Lucene/Elasticsearch/
 Pyserini/Whoosh/`rank_bm25`), exposed through the three entrypoints the grading
 harness calls.
 
-Two ranking strategies are fully implemented; `submission/retrieve.py`'s
-`ACTIVE_STRATEGY` constant selects which one ships. Both are dev-validated and
-independently tested regardless of which is active — switching is a one-line
-change, not a redeploy.
-
-**Currently shipped: `"shipped"`** — plain BM25 (`k1=4.5, b=0.60`) plus an
+`submission/retrieve.py` ships plain BM25 (`k1=4.5, b=0.60`) plus an
 unstemmed pseudo-title field, no feedback pass. Full methodology, the
 parameter search, and every technique tried and rejected along the way are
 in the accompanying report, submitted separately.
@@ -19,45 +14,27 @@ in the accompanying report, submitted separately.
 | nDCG@10 | **0.6395** |
 | MAP@10 | 0.0143 |
 | MRR / P@10 | 0.8839 / 0.6960 |
-| Index size | **22.8 MB** *(23,957,106 bytes; no forward index)* |
+| Index size | **22.8 MB** *(23,957,106 bytes)* |
 | Index build | 2.6 s *(4 cores)* |
 | Index load | ~0.5 s |
 | Query latency | ~0.7 ms mean |
 
-The alternative, `"rm3_stemmed"` (BM25 with pseudo-relevance feedback over a
-stemmed analysis chain plus a stemmed pseudo-title field), scores higher on
-the dev set (nDCG@10 0.6837 vs 0.6395), builds a comparably-sized index
-(21.5 MB), and was what actually shipped through Day 4 of the competition
-round as the held-out A/B this project's earlier notes flagged as pending.
-That read came back: RM3 placed near the bottom of the class on the private
-held-out topics (nDCG@10 0.1714, against the whole class's 0.17-0.23 band on
-Day 4) — a result consistent with RM3's own weakest point in the report's
-5-collection generalisation test (it lost to plain BM25 specifically on
-FiQA, the one structurally-mismatched dataset among the five) and with its
-dev-set advantage never clearing the p<0.05 significance bar this project
-holds every other change to (best honest estimate: p≈0.05–0.08 across four
-independent tests). Switched back to `"shipped"` for the remainder of the
-round on that evidence; `submission/retrieve.py`'s comment above
-`ACTIVE_STRATEGY` and the report cover the full trail.
-
-Three independent optimisations to RM3's own path (kept, and still exercised
-by `tests/test_rm3_strategy.py`, since switching strategies is a one-line
-change either way) got it from an original 51MB / 24s build / 19ms query to
-21.5MB / 2.7s / ~2.5ms, with byte-identical retrieval quality confirmed at
-every step:
-
-- **Forward index built in memory at load time**, not persisted. A
-  document's handful of distinct terms scattered across the whole vocabulary
-  compresses far worse than a term's postings across all documents, so
-  persisting it cost ~30MB for no query-time benefit. Load time isn't a
-  graded efficiency metric, so this is a pure win, not a tradeoff.
-- **A C++ port of NLTK's Porter stemmer** (verified against NLTK across all
-  207,034 distinct tokens the corpus produces, not sampled), plus caching a
-  dict that was being rebuilt from all 171K doc_ids on every query and
-  moving RM3's feedback-term aggregation into a small Cython kernel.
-- **Tokenisation split across the grading machine's 4 cores.** Gated behind
-  a document-count threshold so small corpora take the serial path
-  automatically.
+**A pseudo-relevance-feedback alternative (RM3, over a stemmed analysis
+chain plus a stemmed pseudo-title field) was built, tuned, and shipped
+through Day 4 of the competition round** as the held-out A/B this project's
+earlier notes flagged as pending. It scored higher on the dev set (nDCG@10
+0.6837 vs 0.6395), but that held-out read came back negative: RM3 placed
+near the bottom of the class on the private held-out topics (nDCG@10
+0.1714, against the whole class's 0.17-0.23 band on Day 4) — a result
+consistent with RM3's own weakest point in the report's 5-collection
+generalisation test (it lost to plain BM25 specifically on FiQA, the one
+structurally-mismatched dataset among the five) and with its dev-set
+advantage never clearing the p<0.05 significance bar this project holds
+every other change to (best honest estimate: p≈0.05–0.08 across four
+independent tests). Reverted to plain BM25 on that evidence and **removed
+the RM3 code from this submission entirely** (`submission/rm3.py`,
+`submission/_forward.py`, and their tests) rather than leave an inactive,
+untested path shipped alongside it; the report covers the full trail.
 
 ---
 
@@ -104,20 +81,18 @@ index files, and the same query returns an identical ranking every time
 
 | File | Role |
 |---|---|
-| `retrieve.py` | The three required entrypoints. Deliberately thin; holds `ACTIVE_STRATEGY` and both strategies' tuned constants. |
-| `indexer.py` | Columnar inverted index, delta+VByte postings, `save()`/`load()`. Optional term positions and forward (doc→terms) index. |
+| `retrieve.py` | The three required entrypoints. Deliberately thin; holds the tuned BM25/title constants. |
+| `indexer.py` | Columnar inverted index, delta+VByte postings, `save()`/`load()`. Optional term positions. |
 | `_analysis.py` | The single tokenisation/stopword/stemming chain, shared by indexing and querying. |
 | `_codecs.py` | Delta and VByte integer codecs (vectorised). |
-| `_forward.py` | Doc→terms index, built only when RM3 needs it. |
 | `_scorers.py` | Scorer registry: BM25, BM25+, LM-Dirichlet, PL2, DPH. |
 | `_traverse.py` | One postings traversal feeding every scorer. |
 | `_proximity.py` | Ordered/unordered window counting for term dependence. |
 | `bm25.py` | The required BM25 entrypoint (tunable `k1`, `b`), plus pseudo-title field scoring. |
 | `boolean_vsm.py` | The required Boolean AND/OR and TF-IDF cosine VSM. |
 | `custom_scorer.py` | Sequential Dependence Model over the above (dev-tested, not shipped — see the report). |
-| `rm3.py` | Pseudo-relevance feedback (RM3) over the stemmed body + title. Active when `ACTIVE_STRATEGY = "rm3_stemmed"`. |
 | `setup.py` | Build definition for the optional compiled extensions below. Run from inside `submission/`: `python setup.py build_ext --inplace`. |
-| `_fast.pyx`, `_fastbuild.pyx` | Optional C/C++ extensions (Cython) — fused VByte-decode+BM25 scoring, RM3's feedback-mass aggregation, a C++ tokeniser/builder, and a C++ port of NLTK's Porter stemmer (verified against NLTK across every distinct token the corpus produces). All pure speed: every caller falls back to an equivalent pure-Python/NumPy path if the extension didn't compile, and `tests/test_fast_equivalence.py` asserts bit-identical results. |
+| `_fast.pyx`, `_fastbuild.pyx` | Optional C/C++ extensions (Cython) — fused VByte-decode+BM25 scoring, a C++ tokeniser/builder, and a C++ port of NLTK's Porter stemmer (verified against NLTK across every distinct token the corpus produces). All pure speed: every caller falls back to an equivalent pure-Python/NumPy path if the extension didn't compile, and `tests/test_fast_equivalence.py` asserts bit-identical results. |
 
 ### Design notes
 
@@ -147,7 +122,7 @@ scoring.
 ## Tests
 
 ```bash
-pytest tests/ -v          # 179 tests
+pytest tests/ -v          # 151 tests
 ```
 
 - `test_interface_conformance.py`, `test_metrics.py` — shipped with the starter.
@@ -159,9 +134,6 @@ pytest tests/ -v          # 179 tests
   pure-Python paths, and the submission must still run correctly if they never
   compiled at all. Also guards `submission/setup.py`'s location and the
   float-safety compile flags.
-- `test_forward_index.py`, `test_rm3_strategy.py` — the forward index and the
-  RM3 strategy, including a guard that `ACTIVE_STRATEGY` matches what was
-  actually intended to ship (update it alongside any deliberate switch).
 
 ## `experiments/` — tuning and analysis
 

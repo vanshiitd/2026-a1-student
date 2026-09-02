@@ -16,10 +16,6 @@ works the submission path works.
     # interactive: type queries, blank line or Ctrl-D to quit
     python scripts/query.py
 
-    # with the competition strategy instead of the shipped one
-    python scripts/query.py --build --strategy rm3_stemmed
-    python scripts/query.py --strategy rm3_stemmed "coronavirus origin"
-
 Useful flags:
     -k 20             how many results
     --text            show the start of each document, not just its id
@@ -116,9 +112,6 @@ def main():
     ap.add_argument("--index", default=DEFAULT_INDEX)
     ap.add_argument("--corpus", default=None)
     ap.add_argument("--toy", action="store_true", help="use the small toy corpus")
-    ap.add_argument("--strategy", default=None,
-                    choices=["shipped", "rm3_stemmed"],
-                    help="override ACTIVE_STRATEGY for this run")
     ap.add_argument("-k", type=int, default=10)
     ap.add_argument("--text", action="store_true", help="show document snippets")
     ap.add_argument("--explain", action="store_true", help="show per-term idf")
@@ -130,14 +123,11 @@ def main():
                  f"For the full corpus run: python scripts/download_full_corpus.py")
 
     from submission import retrieve as R
-    if args.strategy:
-        R.ACTIVE_STRATEGY = args.strategy
-    strategy = R.ACTIVE_STRATEGY
 
     if args.build or not os.path.isdir(args.index):
         if not args.build:
             print(f"no index at {args.index} -- building it now", file=sys.stderr)
-        print(f"building [{strategy}] from {os.path.relpath(corpus, REPO)} ...",
+        print(f"building from {os.path.relpath(corpus, REPO)} ...",
               file=sys.stderr)
         t0 = time.perf_counter()
         R.build_index(corpus, args.index)
@@ -176,11 +166,11 @@ def main():
 
     if args.query:
         q = " ".join(args.query)
-        print(f"\n[{strategy}] {q!r}")
+        print(f"\n{q!r}")
         show(q)
         return
 
-    print(f"\n[{strategy}] index loaded in {load_s:.2f}s. "
+    print(f"\nindex loaded in {load_s:.2f}s. "
           f"Type a query, blank line or Ctrl-D to quit.\n")
     while True:
         try:

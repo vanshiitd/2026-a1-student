@@ -235,36 +235,3 @@ def score_bm25_expanded(const int32_t[::1] docids,
             tf = <double>tfs[n]
             scores[d] += idf * (tf * k1_plus_1) / (tf + norm[d])
             touched[d] = 1
-
-
-def accumulate_feedback_mass(const int64_t[::1] term_ids,
-                             const int64_t[::1] tfs,
-                             const int64_t[::1] doc_offsets,
-                             const double[::1] doc_weights,
-                             const double[::1] doc_lens,
-                             double[::1] mass_out):
-    """RM3's feedback-term-mass aggregation, over all feedback docs at once.
-
-    `term_ids`/`tfs` are the concatenation of each feedback document's
-    (already-decoded, ascending-by-term-id) forward-index entries; the
-    per-document decode itself stays in Python/NumPy via ForwardIndex --
-    only the accumulation loop moves here. `doc_offsets[d]:doc_offsets[d+1]`
-    is document d's slice, so the outer/inner loop order below -- docs in
-    the given (rank) order, terms ascending within each doc -- exactly
-    matches the order the pure-Python loop summed in.
-
-    Written as `doc_weights[d] * (tf / doc_lens[d])`, matching
-    `doc_weight * (tf / doc_len)` operation-for-operation: float addition
-    and division are not associative, so reassociating this (e.g.
-    precomputing weight/doc_len once per document) would round differently.
-    """
-    cdef Py_ssize_t n_docs = doc_weights.shape[0]
-    cdef Py_ssize_t d, j
-    cdef double w, dl
-
-    with nogil:
-        for d in range(n_docs):
-            w = doc_weights[d]
-            dl = doc_lens[d]
-            for j in range(doc_offsets[d], doc_offsets[d + 1]):
-                mass_out[term_ids[j]] += w * (<double>tfs[j] / dl)

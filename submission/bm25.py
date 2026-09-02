@@ -98,9 +98,7 @@ def _expanded(index):
         # int32, not int64: doc ids are bounded by index.N, nowhere near
         # int32's ~2.1 billion ceiling even at the "larger collection" scale
         # the held-out evaluation uses (assignment1.tex Sec. 3). cumsum's own
-        # dtype= avoids ever materialising an int64 `running` at all -- this
-        # ran at load time for BOTH strategies (rm3.build() calls _expanded()
-        # directly too), so it was a shared bottleneck, not RM3-specific
+        # dtype= avoids ever materialising an int64 `running` at all
         # (F51/F52, notes/findings.md).
         running = np.cumsum(gaps, dtype=np.int32)
         del gaps
