@@ -1,11 +1,7 @@
 #!/usr/bin/env python
 """
-scripts/query.py — build an index and run ad-hoc queries against it.
-
-Deliberately goes through the SAME three functions the grading harness calls --
-build_index(), load_index(), retrieve() -- rather than reaching into the
-internals. So whatever this prints is what the graders would get, and if this
-works the submission path works.
+scripts/query.py -- build an index and run ad-hoc queries against it.
+goes through build_index/load_index/retrieve, same as the harness
 
     # build the index once (writes to .query_index/ by default)
     python scripts/query.py --build

@@ -1,11 +1,7 @@
 """
-tests/test_codecs.py — property tests for submission/_codecs.py.
-
-The postings file is written once and read back in a different process, so a
-codec bug does not look like a crash: it looks like a quietly wrong ranking.
-These tests exist to make that class of bug impossible to ship. Boundary values
-(the 2^7 / 2^14 / 2^21 / 2^28 VByte width transitions) are tested explicitly
-because that is where an off-by-one in the width table would hide.
+tests/test_codecs.py -- round trip / boundary tests for _codecs.py.
+testing width boundaries explicitly since that's where an off by one
+in vbyte would hide
 """
 import numpy as np
 import pytest
@@ -19,7 +15,6 @@ from submission._codecs import (
     vbyte_encode,
 )
 
-# The exact widths where VByte adds a byte.
 BOUNDARIES = [0, 1, 126, 127, 128, 129, 16382, 16383, 16384, 16385,
               2097151, 2097152, 268435455, 268435456, 2**32 - 1]
 
@@ -33,7 +28,6 @@ def test_vbyte_round_trip_on_width_boundaries():
 @pytest.mark.parametrize("seed", range(8))
 def test_vbyte_round_trip_random(seed):
     rng = np.random.default_rng(seed)
-    # Mixed magnitudes so every VByte width is exercised in one buffer.
     values = np.concatenate([
         rng.integers(0, 127, size=200),
         rng.integers(0, 16383, size=200),
@@ -45,8 +39,6 @@ def test_vbyte_round_trip_random(seed):
 
 
 def test_vbyte_widths_are_minimal():
-    # 1 byte per value below 128, 2 below 16384 -- if this regresses, the index
-    # silently grows and the index-size component (Section 7) suffers.
     assert vbyte_encode(np.array([127] * 10)).size == 10
     assert vbyte_encode(np.array([128] * 10)).size == 20
     assert vbyte_encode(np.array([16383] * 10)).size == 20
@@ -70,7 +62,7 @@ def test_vbyte_detects_wrong_expected_count():
 
 
 def test_vbyte_detects_truncated_buffer():
-    buf = vbyte_encode(np.array([300], dtype=np.int64))  # 2 bytes
+    buf = vbyte_encode(np.array([300], dtype=np.int64))
     with pytest.raises(ValueError, match="truncated"):
         vbyte_decode(buf[:1], 1)
 
@@ -93,18 +85,15 @@ def test_sorted_id_round_trip_random(seed):
 
 
 def test_gap_encoding_actually_shrinks_dense_postings():
-    # The whole justification for delta+VByte: a dense postings list should cost
-    # ~1 byte per posting, not 4. If this fails the compression story is broken.
-    ids = np.arange(0, 100_000, 3, dtype=np.int64)  # gaps of 3
+    ids = np.arange(0, 100_000, 3, dtype=np.int64)
     encoded = encode_sorted_ids(ids)
     assert encoded.size < ids.size * 1.1, "dense gaps should cost ~1 byte each"
     assert encoded.size < ids.nbytes / 3, "should be far smaller than raw int64"
 
 
 def test_index_files_are_compressed_on_disk():
-    """The on-disk byte size is the graded metric, so persisted files must stay
-    compressed. This guards against a refactor quietly reverting to raw writes.
-    """
+    """on-disk size is graded, make sure a refactor doesn't quietly go back
+    to raw uncompressed writes"""
     import os, tempfile, zlib
     from submission.indexer import InvertedIndex
 
@@ -113,12 +102,12 @@ def test_index_files_are_compressed_on_disk():
     with tempfile.TemporaryDirectory() as d:
         ix.save(d)
         for name in os.listdir(d):
-            if name == "meta.json":       # left plain: needed to read the version
+            if name == "meta.json":
                 continue
             blob = open(os.path.join(d, name), "rb").read()
             if not blob:
                 continue
-            zlib.decompress(blob)          # raises if not a zlib stream
+            zlib.decompress(blob)
         reloaded = InvertedIndex.load(d)
     assert reloaded.terms == ix.terms
     np.testing.assert_array_equal(reloaded.df, ix.df)

@@ -3,19 +3,10 @@
 # cython: wraparound=False
 # cython: cdivision=True
 """
-submission/_fast.pyx — fused VByte decode + BM25 scoring in C.
-
-Profiling showed 90% of per-query time in four phases that each walk the
-same ~480,000 postings (VByte decode, gap cumsum, doc-length gather, BM25
-arithmetic), with NumPy making five passes and four intermediate allocations.
-This collapses all four into one pass, no intermediate allocation.
-
-Written to match submission/_scorers.py's `bm25_contribution` operation-for-
-operation, so both paths produce bit-identical float64 results, not merely
-similar ones -- asserted by tests/test_fast_equivalence.py.
-
-An optimisation, not a hard dependency: every caller imports this behind
-try/except and keeps a working pure-Python path.
+submission/_fast.pyx -- fused vbyte decode + bm25 in C, avoids numpy's
+multiple passes/allocations per query. matches _scorers.py bit for bit,
+checked in tests/test_fast_equivalence.py. pure speedup, has a python
+fallback if this doesn't compile
 """
 
 import numpy as np
@@ -26,11 +17,7 @@ cnp.import_array()
 
 
 cdef inline uint64_t _read_vbyte(const uint8_t[::1] buf, Py_ssize_t *pos) noexcept nogil:
-    """Decode one VByte value, advancing *pos past it.
-
-    Low 7 bits carry payload; the high bit means "another byte follows" --
-    identical to the format written by submission/_codecs.py.
-    """
+    """same format as _codecs.py's vbyte"""
     cdef uint64_t value = 0
     cdef int shift = 0
     cdef uint8_t byte
@@ -55,14 +42,7 @@ def score_bm25_term(const uint8_t[::1] docid_buf,
                     double k1,
                     double b,
                     double avgdl):
-    """Decode one term's postings and accumulate its BM25 contribution.
-
-        contribution = idf * (tf * (k1 + 1)) / (tf + k1*(1 - b + b*dl/avgdl))
-
-    `docid_buf` holds delta-encoded document ids, `tf_buf` the parallel term
-    frequencies, both VByte-packed. `scores` and `touched` are accumulated into
-    in place, indexed by internal document id.
-    """
+    """decode one term's postings + accumulate bm25 score in one pass"""
     cdef Py_ssize_t dpos = 0, fpos = 0, n
     cdef int64_t docid = 0
     cdef double tf, dl, norm
@@ -74,7 +54,6 @@ def score_bm25_term(const uint8_t[::1] docid_buf,
             docid += <int64_t>_read_vbyte(docid_buf, &dpos)
             tf = <double>_read_vbyte(tf_buf, &fpos)
             dl = <double>doc_len[docid]
-            # Same operation order as the NumPy path, so rounding matches.
             norm = k1 * (one_minus_b + b * (dl / avgdl))
             scores[docid] += idf * (tf * k1_plus_1) / (tf + norm)
             touched[docid] = 1
@@ -83,13 +62,7 @@ def score_bm25_term(const uint8_t[::1] docid_buf,
 def decode_postings(const uint8_t[::1] docid_buf,
                     const uint8_t[::1] tf_buf,
                     Py_ssize_t count):
-    """Decode a postings list to (doc_ids, tfs) arrays.
-
-    Kept for the paths that genuinely need materialised arrays (Boolean search,
-    the experiment harness). Still a single pass per buffer rather than NumPy's
-    five, but it does allocate its outputs, so the fused scorer above is the one
-    that matters for query latency.
-    """
+    """decode to (doc_ids, tfs) arrays, for paths that need materialised arrays"""
     cdef cnp.ndarray[int64_t, ndim=1] docs = np.empty(count, dtype=np.int64)
     cdef cnp.ndarray[int64_t, ndim=1] tfs = np.empty(count, dtype=np.int64)
     cdef int64_t[::1] dv = docs
@@ -117,14 +90,8 @@ def score_bm25_term_packed(const uint8_t[::1] docid_buf,
                            double k1,
                            double b,
                            double avgdl):
-    """As `score_bm25_term`, reading nibble-packed term frequencies.
-
-    A posting's nibble index is its posting index, so `tf_start` (the term's
-    first posting) is all the offset information needed -- there is no per-term
-    tf offset table. A zero nibble is the escape code meaning "this tf is in the
-    exception list"; exceptions are visited in order, so `exc_val` is simply the
-    slice of exceptions belonging to this term.
-    """
+    """same as score_bm25_term but tf is nibble packed. nibble index ==
+    posting index so no offset table needed. 0 nibble = read from exc_val"""
     cdef Py_ssize_t dpos = 0, n, j, exc_i = 0
     cdef int64_t docid = 0
     cdef double tf, dl, norm
@@ -152,17 +119,8 @@ def score_bm25_term_packed(const uint8_t[::1] docid_buf,
 def select_top_k(const double[::1] scores,
                  const uint8_t[::1] touched,
                  int k):
-    """Top-k in one pass, without materialising the candidate set.
-
-    The NumPy route (flatnonzero + gather + argpartition) makes three passes
-    and two allocations over the candidate set -- ~152,000 of 171,000
-    documents on this collection, which dominated query time just to find
-    ten results. This keeps a sorted array of the best k seen so far,
-    ascending by score; for k=10, linear insertion beats a heap.
-
-    Ties break on ascending document id, matching the NumPy path: a tie does
-    NOT displace the incumbent, so the earlier id survives.
-    """
+    """top-k in one pass instead of numpy's flatnonzero+gather+argpartition.
+    keeps a sorted best-k-so-far array, linear insertion, fine for small k"""
     cdef Py_ssize_t n = scores.shape[0]
     cdef Py_ssize_t i, j
     cdef int filled = 0
@@ -182,13 +140,8 @@ def select_top_k(const double[::1] scores,
                 continue
             s = scores[i]
             if filled < k:
-                # Insert into the ascending-by-score prefix.
                 j = filled
-                # >= not > : the array is ascending and gets reversed on return,
-                # so a new equal score must be placed BEFORE the incumbent here
-                # to end up AFTER it in the result. Documents are scanned in
-                # ascending id order, so this is what makes ties resolve to the
-                # smaller id, matching np.lexsort((cand, -values)).
+                # >= not > here, matters for tie-break to match np.lexsort
                 while j > 0 and bs[j - 1] >= s:
                     bs[j] = bs[j - 1]
                     bi[j] = bi[j - 1]
@@ -197,7 +150,6 @@ def select_top_k(const double[::1] scores,
                 bi[j] = i
                 filled += 1
             elif s > bs[0]:
-                # Strictly greater, so an equal score never evicts an earlier id.
                 j = 0
                 while j + 1 < k and bs[j + 1] < s:
                     bs[j] = bs[j + 1]
@@ -206,7 +158,6 @@ def select_top_k(const double[::1] scores,
                 bs[j] = s
                 bi[j] = i
 
-    # Stored ascending; the caller wants best first.
     return best_i[:filled][::-1].copy(), best_s[:filled][::-1].copy()
 
 
@@ -217,14 +168,8 @@ def score_bm25_expanded(const int32_t[::1] docids,
                         uint8_t[::1] touched,
                         double idf,
                         double k1_plus_1):
-    """BM25 over pre-expanded postings with a precomputed length norm.
-
-    Decoding and one of the two per-posting divisions move to load time
-    (unscored): postings expand once into flat arrays at load (on-disk stays
-    VByte+deflate), and the length norm k1*(1-b+b*dl/avgdl) is precomputed
-    per document since it doesn't depend on the term. Inner loop is left with
-    a gather, a multiply, one divide, an add.
-    """
+    """bm25 over already-decoded postings + precomputed length norm, for
+    the hot query path after load-time expansion"""
     cdef Py_ssize_t n, count = docids.shape[0]
     cdef int32_t d
     cdef double tf

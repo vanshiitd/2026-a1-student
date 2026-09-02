@@ -1,21 +1,7 @@
 """
-tests/test_fast_equivalence.py — the C extension must be an optimisation only.
-
-submission/_fast.pyx exists purely for speed. These tests pin down the two
-properties that make that acceptable:
-
-  1. **Bit-identical results.** Not "similar rankings", not "close scores" --
-     the same float64 values. The kernel performs the same operations in the
-     same order as the NumPy path and is compiled without -ffast-math, so exact
-     equality is achievable and therefore worth asserting. Anything weaker would
-     let a scoring discrepancy hide behind a rounding excuse.
-
-  2. **A working fallback.** If the extension did not compile, the submission
-     must still produce correct results. Speed must never become a correctness
-     dependency at a graded boundary.
-
-If the extension is not built, the equivalence tests skip and the fallback test
-still runs.
+tests/test_fast_equivalence.py -- C extension must be bit identical to the
+numpy path (not just close), and everything must still work with a pure
+python fallback if the extension didn't compile
 """
 import numpy as np
 import os
@@ -52,7 +38,6 @@ def index():
 ])
 @pytest.mark.parametrize("k1,b", [(1.2, 0.75), (4.5, 0.60), (0.3, 0.0), (12.0, 1.0)])
 def test_c_and_python_paths_are_bit_identical(index, query, k1, b):
-    """Same doc order AND the same float64 bits, across parameter extremes."""
     from submission import _traverse
     fast_results = bm25._score_fast(index, query, 10, k1, b)
     numpy_results = _traverse.score_single(index, query, "bm25", 10, k1=k1, b=b)
@@ -64,7 +49,7 @@ def test_c_and_python_paths_are_bit_identical(index, query, k1, b):
 
 @pytest.mark.parametrize("seed", range(5))
 def test_decode_postings_on_random_wide_gaps(seed):
-    """Exercise multi-byte VByte values, which a small toy corpus never reaches."""
+    """multi-byte vbyte values, a toy corpus never reaches these"""
     rng = np.random.default_rng(seed)
     docs = np.unique(rng.integers(0, 5_000_000, size=3000)).astype(np.int64)
     tfs = rng.integers(1, 40_000, size=docs.size).astype(np.int64)
@@ -75,7 +60,6 @@ def test_decode_postings_on_random_wide_gaps(seed):
 
 
 def test_fallback_produces_identical_results_when_extension_is_absent(index, monkeypatch):
-    """Simulate a submission where the extension failed to compile."""
     with_fast = bm25.score("beta gamma", 10, k1=4.5, b=0.60)
     monkeypatch.setattr(bm25, "HAVE_FAST", False)
     without_fast = bm25.score("beta gamma", 10, k1=4.5, b=0.60)
@@ -84,7 +68,6 @@ def test_fallback_produces_identical_results_when_extension_is_absent(index, mon
 
 
 def test_extension_does_not_mutate_the_index(index):
-    """The kernel writes into caller-owned score buffers only."""
     before = (index._docid_buf.copy(), index._tf_packed.copy(),
               index._tf_exc_val.copy(), index.doc_len.copy())
     bm25.score("alpha beta gamma", 10, k1=4.5, b=0.60)
@@ -95,20 +78,14 @@ def test_extension_does_not_mutate_the_index(index):
 
 
 def _synthetic_corpus(n_docs=1500, seed=0):
-    """Corpus large and varied enough to expose float divergence.
-
-    The small fixture above did NOT catch a real bug: with -O3 the compiler
-    fused `a*b + c` into a single FMA instruction, rounding once instead of
-    twice, and the kernel diverged from NumPy on the full 171K-document corpus
-    while passing every small-fixture test. Accumulating many contributions per
-    document with widely varying lengths is what surfaces it, so the regression
-    guard has to be built that way.
-    """
+    """bigger + wider length spread than the fixture -- caught a real FMA
+    rounding bug once that only showed up at this scale, not on the small
+    fixture"""
     rng = np.random.default_rng(seed)
     vocab = [f"t{i}" for i in range(400)]
     corpus = []
     for i in range(n_docs):
-        length = int(rng.integers(3, 600))          # deliberately wide spread
+        length = int(rng.integers(3, 600))
         words = rng.choice(vocab, size=length, replace=True)
         corpus.append((f"s{i}", " ".join(words)))
     return corpus
@@ -131,17 +108,13 @@ def test_bit_identical_on_a_corpus_large_enough_to_expose_fp_contraction(k1, b):
         for (_a, sa), (_b2, sb) in zip(fast_r, numpy_r):
             assert sa == sb, (
                 f"score bits differ ({sa!r} vs {sb!r}) for {query!r} at k1={k1}, b={b}. "
-                "Check the compiler is not contracting a*b+c into an FMA "
-                "(-ffp-contract=off in setup.py)."
+                "check -ffp-contract=off in setup.py"
             )
 
 
-# ---------------------------------------------------------------------------
-# Build-side kernel (submission/_fastbuild.pyx)
-# ---------------------------------------------------------------------------
+# build side kernel (_fastbuild.pyx)
 
 def _build_both(corpus, config=None):
-    """Build the same corpus with and without the C++ kernel."""
     import submission.indexer as ixmod
     from submission._analysis import AnalysisConfig
     cfg = config or AnalysisConfig()
@@ -170,9 +143,6 @@ def test_cpp_builder_produces_a_byte_identical_index():
 
 
 def test_cpp_builder_produces_a_byte_identical_index_when_stemmed():
-    """The C++ Porter port must produce the identical index to the Python
-    stemming path, not just an equivalent stemmer function in isolation --
-    this exercises the actual build_from_jsonl()/Builder wiring end to end."""
     pytest.importorskip("submission._fastbuild")
     from submission._analysis import AnalysisConfig
     _assert_identical(*_build_both(_synthetic_corpus(400, seed=3),
@@ -180,29 +150,19 @@ def test_cpp_builder_produces_a_byte_identical_index_when_stemmed():
 
 
 @pytest.mark.parametrize("corpus", [
-    [("d1", "")],                                     # empty document
-    [("d1", "   !!!   ")],                            # nothing tokenisable
-    [("d1", "a"), ("d2", "a a"), ("d3", "b")],        # minimal
-    [("d1", "COVID-19 SARS-CoV-2 100% α β 你好")],     # punctuation and non-Latin
-    [("d1", "x" * 40 + " ok")],                       # token beyond max_token_len
-    [("d1", "Ω".join(["term"] * 50))],                # non-ASCII separators
+    [("d1", "")],
+    [("d1", "   !!!   ")],
+    [("d1", "a"), ("d2", "a a"), ("d3", "b")],
+    [("d1", "COVID-19 SARS-CoV-2 100% α β 你好")],
+    [("d1", "x" * 40 + " ok")],
+    [("d1", "Ω".join(["term"] * 50))],
 ])
 def test_cpp_builder_matches_python_on_awkward_input(corpus):
-    """UTF-8 continuation bytes must never be mistaken for token characters, and
-    the over-long-token filter must drop exactly what the Python analyzer drops
-    -- document length feeds BM25's normalisation, so any drift changes scores."""
     pytest.importorskip("submission._fastbuild")
     _assert_identical(*_build_both(corpus))
 
 
 def test_cpp_builder_declines_configs_it_cannot_reproduce():
-    """Stopword removal and alphanum-splitting are not implemented in the
-    kernel; it must say so rather than silently building a different index.
-
-    Porter stemming IS supported (a C++ port of nltk's NLTK_EXTENSIONS mode,
-    exhaustively verified against nltk across all 207,034 distinct tokens in
-    the real corpus vocabulary -- see test_porter_stemmer_matches_nltk below).
-    """
     fb = pytest.importorskip("submission._fastbuild")
     from submission._analysis import AnalysisConfig
     assert fb.Builder.supports(AnalysisConfig())
@@ -212,63 +172,40 @@ def test_cpp_builder_declines_configs_it_cannot_reproduce():
     assert not fb.Builder.supports(AnalysisConfig(split_alphanum=True))
 
 
-# ---------------------------------------------------------------------------
-# Build-definition placement (course staff clarification, 26 Aug)
-# ---------------------------------------------------------------------------
-# Staff run `python setup.py build_ext --inplace` FROM INSIDE submission/, and
-# only if submission/setup.py exists. Getting this wrong fails silently: the
-# build is skipped or lands the .so in the wrong place, every import falls back
-# to pure Python, and the submission still passes its tests -- just slowly.
-# These tests pin the placement down so that cannot happen unnoticed.
+# build definition placement, staff run this from inside submission/
 
 def test_setup_py_lives_in_submission_where_grading_looks_for_it():
     import pathlib
     repo = pathlib.Path(__file__).resolve().parent.parent
     assert (repo / "submission" / "setup.py").is_file(), (
-        "submission/setup.py is missing. Staff only build a compiled extension "
-        "if this exact path exists; without it the C kernels are never compiled.")
-    assert not (repo / "setup.py").exists(), (
-        "A stray root setup.py is no longer the build definition and will "
-        "mislead anyone running the build by hand.")
+        "submission/setup.py missing, staff only build the extension if this exact path exists")
+    assert not (repo / "setup.py").exists(), "stray root setup.py, not the real build def anymore"
 
 
 def test_extension_module_names_are_bare_so_inplace_output_lands_correctly():
-    """Dotted names would nest the .so at submission/submission/_fast.so."""
     import pathlib
     src = (pathlib.Path(__file__).resolve().parent.parent
            / "submission" / "setup.py").read_text()
     assert '"submission._fast"' not in src and '"submission._fastbuild"' not in src, (
-        "Module names must be bare (_fast, not submission._fast): setup.py is "
-        "run with submission/ as the working directory, so a dotted name puts "
-        "the built .so one directory too deep and the import fails.")
-    assert 'sources=["_fast.pyx"]' in src and 'sources=["_fastbuild.pyx"]' in src, (
-        "Source paths must be relative to submission/, not the repo root.")
+        "module names must be bare, dotted names put the .so one dir too deep")
+    assert 'sources=["_fast.pyx"]' in src and 'sources=["_fastbuild.pyx"]' in src
 
 
 def test_float_safety_flag_survives_the_move():
-    """-ffp-contract=off is what keeps the C kernel bit-identical to NumPy."""
     import pathlib
     src = (pathlib.Path(__file__).resolve().parent.parent
            / "submission" / "setup.py").read_text()
-    assert '"-ffp-contract=off"' in src, (
-        "Without this flag the compiler fuses a*b+c into an FMA, which rounds "
-        "once instead of twice and diverges from NumPy on the full corpus.")
-    # Quoted form only: the file explains in a COMMENT why -ffast-math is
-    # excluded, and that prose must not trip the check.
-    assert '"-ffast-math"' not in src, "-ffast-math would break bit-identity."
+    assert '"-ffp-contract=off"' in src, "without this the C kernel drifts from numpy"
+    assert '"-ffast-math"' not in src, "-ffast-math would break bit-identity"
 
 
 def test_no_precompiled_binaries_are_tracked_by_git():
-    """Staff are explicit: do not commit a precompiled .so."""
     import subprocess, pathlib
     repo = pathlib.Path(__file__).resolve().parent.parent
     try:
         out = subprocess.run(["git", "ls-files"], cwd=repo,
                              capture_output=True, text=True)
     except (FileNotFoundError, OSError):
-        # The grading/Docker image is python:*-slim and ships no git binary.
-        # This check is about what the repository tracks, so it is meaningful
-        # only where there is a repository to ask.
         pytest.skip("git not available (slim image); nothing to check here")
     if out.returncode != 0:
         pytest.skip("not a git checkout")
@@ -278,7 +215,7 @@ def test_no_precompiled_binaries_are_tracked_by_git():
 
 
 def test_build_index_does_not_compile_anything():
-    """A one-time compile must not be billed to the index-build-time metric."""
+    """compile has to happen at image-build time, not inside build_index()"""
     import pathlib
     subdir = pathlib.Path(__file__).resolve().parent.parent / "submission"
     for py in subdir.glob("*.py"):
@@ -286,25 +223,10 @@ def test_build_index_does_not_compile_anything():
             continue
         src = py.read_text()
         for forbidden in ("subprocess", "pyximport", "build_ext", "os.system"):
-            assert forbidden not in src, (
-                f"{py.name} references {forbidden!r}; compilation must happen at "
-                "image-build time, never inside build_index().")
+            assert forbidden not in src, f"{py.name} references {forbidden!r}"
 
 
-# ---------------------------------------------------------------------------
-# Porter stemmer C++ port (submission/_fastbuild.pyx's porter_stem)
-# ---------------------------------------------------------------------------
-# A direct structural port of nltk.stem.porter.PorterStemmer's NLTK_EXTENSIONS
-# mode (the only mode submission/_analysis.py uses), so the C++ build path
-# can stem tokens instead of falling back to pure Python. Correctness bar:
-# bit-identical to nltk for every token the corpus's tokenizer can produce.
-#
-# _PORTER_EXAMPLES covers every worked example from the algorithm's own
-# docstrings (all 8 steps, the NLTK-only ied/ies/alli/fulli/logi extensions,
-# every irregular-pool entry, alphanumeric corpus-specific tokens, and the
-# length<=2 passthrough) -- runs unconditionally, no corpus needed. The
-# exhaustive test below additionally checks all ~207K distinct tokens in the
-# real corpus when it's present locally, skipping gracefully otherwise.
+# porter stemmer C++ port, bit identical to nltk required
 
 _PORTER_EXAMPLES = [
     "caresses", "ponies", "ties", "caress", "cats", "feed", "agreed",
@@ -338,9 +260,8 @@ def test_porter_stemmer_matches_nltk_on_worked_examples():
 
 
 def test_porter_stemmer_matches_nltk_exhaustively_on_the_real_corpus():
-    """Every one of the ~207,034 distinct pre-stem tokens the real corpus can
-    produce, not a sample. Skips if the full corpus isn't present locally --
-    it's gitignored and fetched separately, not part of the required tree."""
+    """all ~207k distinct tokens the real corpus can produce, not a sample.
+    skips if the corpus isn't downloaded locally"""
     import json
     import os
     import re
@@ -369,24 +290,13 @@ def test_porter_stemmer_matches_nltk_exhaustively_on_the_real_corpus():
 
 
 def test_porter_stemmer_handles_edge_cases_without_crashing():
-    """Empty input, length-1/2 words, all-consonants, all-vowels, runs of y."""
     fb = pytest.importorskip("submission._fastbuild")
     for word in (b"", b"a", b"ab", b"y", b"yy", b"yyyy", b"bcdfg", b"aeiou",
                 b"0", b"00000000", b"x" * 32):
         fb.porter_stem(word)  # must not raise
 
 
-# ---------------------------------------------------------------------------
-# Parallel build (submission/indexer.py's build_from_jsonl_parallel)
-# ---------------------------------------------------------------------------
-# Splits per-document tokenisation across processes; postings assembly stays
-# serial (a whole-collection step by nature), so this is bounded by Amdahl's
-# law, not a 4x cut -- measured ~1.75x at n_workers=4 on the real corpus, not
-# the ~4x a naive "more cores" intuition would suggest.
-#
-# min_docs=0 forces the parallel path on a small corpus purely for test
-# speed; the size gate itself (_PARALLEL_MIN_DOCS) is production tuning, not
-# something correctness depends on.
+# parallel build (indexer.py build_from_jsonl_parallel)
 
 def _write_jsonl_corpus(path, corpus):
     import json
@@ -424,8 +334,6 @@ def test_parallel_build_is_byte_identical_to_serial(tmp_path, n_workers):
 
 
 def test_parallel_build_declines_below_the_doc_count_threshold():
-    """The default gate must actually gate -- a tiny corpus should take the
-    serial path even when the fast builder supports its analysis chain."""
     pytest.importorskip("submission._fastbuild")
     toy_corpus = os.path.join(os.path.dirname(__file__), "..", "data", "toy", "corpus.jsonl")
     ix = InvertedIndex()
@@ -434,8 +342,6 @@ def test_parallel_build_declines_below_the_doc_count_threshold():
 
 
 def test_parallel_build_declines_at_n_workers_1():
-    """Splitting across exactly one worker buys nothing; must decline rather
-    than pay multiprocessing overhead for zero parallelism."""
     pytest.importorskip("submission._fastbuild")
     ix = InvertedIndex()
     assert not ix.build_from_jsonl_parallel(
@@ -444,8 +350,6 @@ def test_parallel_build_declines_at_n_workers_1():
 
 
 def test_parallel_build_declines_for_unsupported_analysis_chains():
-    """Falls back cleanly (returns False) rather than silently building a
-    different index, for the same configs the serial fast path declines."""
     pytest.importorskip("submission._fastbuild")
     from submission._analysis import AnalysisConfig
     ix = InvertedIndex(AnalysisConfig(remove_stopwords=True))
@@ -455,8 +359,6 @@ def test_parallel_build_declines_for_unsupported_analysis_chains():
 
 
 def test_parallel_build_handles_empty_and_tiny_corpora(tmp_path):
-    """Degenerate n_docs (0, 1, fewer than n_workers) must not crash the
-    byte-range splitter or the merge step."""
     pytest.importorskip("submission._fastbuild")
     for corpus in ([], [("d1", "a b c")], [("d1", "a"), ("d2", "b")]):
         corpus_path = str(tmp_path / f"c{len(corpus)}.jsonl")

@@ -1,25 +1,15 @@
 """
-submission/_analysis.py — the single text-analysis chain.
-
-Every token entering the index and every token leaving a query passes through
-`analyze()`. An index built with one tokenizer and queried with another
-silently loses recall in a way that looks like a bad scorer, not a bug.
-
-Config-driven rather than hardcoded, and persisted into the index's
-meta.json so a query can never be analysed differently from the corpus it's
-run against, even if the module's defaults change between build and load.
+submission/_analysis.py -- tokenizer/stemmer used by both indexing and
+querying. config gets saved in the index meta so build and query never
+go out of sync
 """
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional
 import re
 
-# Lowercase alphanumeric runs. Matches submission/indexer.py's shipped tokenizer
-# so day-1 results are directly comparable to the starter baseline.
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
-# Small INQUERY-style stoplist. Not enabled by default -- plan.md L1 decides
-# this empirically, and note that stopwords must stay in the *positional* index
-# even if excluded from scoring, or proximity distances become wrong.
+# small stoplist, not used by default (see report)
 DEFAULT_STOPWORDS = frozenset("""
 a an and are as at be by for from has he in is it its of on that the to was were
 will with this these those there their they them then than or but not no if
@@ -28,25 +18,18 @@ will with this these those there their they them then than or but not no if
 
 @dataclass(frozen=True)
 class AnalysisConfig:
-    """Serialisable description of the analysis chain.
-
-    Persisted into the index so build-time and query-time analysis provably
-    match. Add fields here rather than adding parameters to `analyze()`.
-    """
     lowercase: bool = True
     remove_stopwords: bool = False
-    stemmer: Optional[str] = None       # None | "porter" (plan.md L1)
+    stemmer: Optional[str] = None       # None | "porter"
     min_token_len: int = 1
-    max_token_len: int = 32             # guards against junk/base64 blobs
-    split_alphanum: bool = False        # "covid19" -> ["covid", "19"] (L1)
+    max_token_len: int = 32
+    split_alphanum: bool = False        # covid19 -> covid, 19
 
     def to_dict(self) -> Dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: Dict) -> "AnalysisConfig":
-        # Ignore unknown keys so an index written by a newer build still loads
-        # rather than exploding at grading time.
         known = {f for f in cls.__dataclass_fields__}
         return cls(**{k: v for k, v in d.items() if k in known})
 
@@ -57,10 +40,7 @@ _ALPHA_NUM_SPLIT_RE = re.compile(r"(?<=[a-z])(?=[0-9])|(?<=[0-9])(?=[a-z])")
 
 
 class _Analyzer:
-    """Applies an AnalysisConfig. Holds the stem cache, which is why this is a
-    class and not a bare function: stemming is the hot loop during indexing and
-    natural text has a very high repeat rate, so memoising it is worth far more
-    than it costs."""
+    """holds the stem cache so class not just a function"""
 
     def __init__(self, config: AnalysisConfig = DEFAULT_CONFIG):
         self.config = config
@@ -73,9 +53,7 @@ class _Analyzer:
         if name is None:
             return None
         if name == "porter":
-            # Deferred until Piazza Q4 confirms NLTK is pre-approved (see
-            # notes/piazza_q1.md). plan.md L1 owns this decision on 24 Aug.
-            from nltk.stem import PorterStemmer  # noqa: F401  (import-time check)
+            from nltk.stem import PorterStemmer  # noqa: F401
             return PorterStemmer().stem
         raise ValueError(f"unknown stemmer {name!r}")
 
@@ -114,18 +92,11 @@ _default_analyzer = _Analyzer(DEFAULT_CONFIG)
 
 
 def analyze(text: str, config: Optional[AnalysisConfig] = None) -> List[str]:
-    """Turn raw text into the token sequence that is actually indexed/queried.
-
-    Passing `config=None` uses the module default. Callers that hold an index
-    should pass that index's persisted config instead, so analysis provably
-    matches what the postings were built from.
-    """
     if config is None or config == DEFAULT_CONFIG:
         return _default_analyzer(text)
     return _Analyzer(config)(text)
 
 
 def make_analyzer(config: AnalysisConfig = DEFAULT_CONFIG) -> _Analyzer:
-    """Build a reusable analyzer. Prefer this over repeated `analyze()` calls in
-    a hot loop -- it keeps the stem cache alive across documents."""
+    """use this instead of analyze() in a loop, keeps stem cache warm"""
     return _Analyzer(config)

@@ -1,11 +1,6 @@
 """
-submission/_traverse.py — one postings traversal, N scorers.
-
-Decodes each query term's postings exactly once and hands the arrays to
-every active scorer, so running several rankers doesn't cost several
-traversals. Term-at-a-time full accumulate: exact (produces the true top-k),
-and fast enough at this collection's scale that early termination isn't
-needed.
+submission/_traverse.py -- decode postings once per query term, feed to all
+active scorers so N scorers = 1 traversal not N traversals
 """
 from collections import Counter
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -16,7 +11,6 @@ from submission import _scorers
 from submission._analysis import analyze
 from submission._scorers import CollectionStats
 
-# alias -> (scorer_name, param overrides)
 ScorerSpec = Dict[str, Tuple[str, Optional[Dict[str, float]]]]
 
 
@@ -29,12 +23,8 @@ def collection_stats(index) -> CollectionStats:
 
 
 def query_terms(index, query: str) -> List[Tuple[str, int]]:
-    """Analyse `query` with the *index's own* persisted config and return
-    (term, query_term_frequency) pairs.
-
-    Using the index's config rather than the module default is what guarantees a
-    query can never be tokenised differently from the corpus it runs against.
-    """
+    """uses index's own saved config, not module default, so query never
+    gets tokenised differently than the corpus"""
     tokens = analyze(query, index.config)
     return list(Counter(tokens).items())
 
@@ -45,11 +35,8 @@ def score_query(
     specs: ScorerSpec,
     k: int = 10,
 ) -> Dict[str, List[Tuple[str, float]]]:
-    """Score `query` with several scorers over a single postings traversal.
-
-    Returns {alias: [(external_doc_id, score), ...]}, each list sorted by score
-    descending and truncated to `k`.
-    """
+    """score with multiple scorers over one traversal, returns
+    {alias: [(doc_id, score), ...]} sorted desc, truncated to k"""
     resolved = {
         alias: (_scorers.get(name), _scorers.resolve_params(name, overrides))
         for alias, (name, overrides) in specs.items()
@@ -65,7 +52,7 @@ def score_query(
     for term, query_tf in terms:
         tid = index.term_id(term)
         if tid < 0:
-            continue  # out-of-vocabulary term contributes nothing
+            continue
         doc_ids, tfs = index.postings_by_id(tid)
         if doc_ids.size == 0:
             continue
@@ -74,7 +61,6 @@ def score_query(
         cf = int(index.cf[tid])
         touched[doc_ids] = True
 
-        # The payoff: postings decoded once above, reused by every scorer here.
         for alias, (scorer, params) in resolved.items():
             accum[alias][doc_ids] += scorer.term_contribution(
                 tfs, doc_lens, df, cf, query_tf, stats, **params
@@ -95,27 +81,16 @@ def score_query(
 
 
 def score_single(index, query: str, scorer_name: str, k: int = 10, **params):
-    """Convenience wrapper for scoring with exactly one scorer."""
     return score_query(index, query, {"_": (scorer_name, params or None)}, k)["_"]
 
 
 def _top_k(index, candidates: np.ndarray, scores: np.ndarray, k: int) -> List[Tuple[str, float]]:
-    """Top-k with a deterministic tie-break.
-
-    Ties break on ascending internal document id (i.e. corpus order), which is
-    stable across runs and across processes. The interface contract requires
-    determinism, and an arbitrary-but-consistent tie-break is what delivers it.
-    """
+    """top-k, ties broken on ascending doc id for determinism"""
     if candidates.size == 0 or k <= 0:
         return []
     cand_scores = scores[candidates]
-    # Full lexsort rather than argpartition-then-sort. argpartition is O(n) and
-    # faster, but when the k-th and (k+1)-th scores TIE it picks between them
-    # arbitrarily, so it disagreed with the C kernel on 3 of 50 dev topics --
-    # same scores, same nDCG, different tied document at rank 10. Sorting the
-    # whole candidate set by (score desc, doc id asc) makes the boundary
-    # deterministic and matches the kernel exactly. This is the fallback path,
-    # so the extra cost is irrelevant.
+    # full lexsort not argpartition -- argpartition ties break arbitrarily,
+    # disagreed w/ the C kernel on a few dev topics because of it
     order = np.lexsort((candidates, -cand_scores))[:k]
     return [(index.doc_ids[int(candidates[i])], float(cand_scores[i])) for i in order]
 
@@ -126,17 +101,8 @@ def rrf_fuse(
     rrf_k: float = 60.0,
     weights: Optional[Sequence[float]] = None,
 ) -> List[Tuple[str, float]]:
-    """Reciprocal Rank Fusion (Cormack et al. 2009):
-
-        score(d) = sum_r  w_r / (rrf_k + rank_r(d))
-
-    Rank-based, so it is immune to the score-scale mismatch between BM25 and a
-    log-probability language model -- which is exactly why plan.md Section 5.0
-    makes it the default fusion method rather than weighted score summation.
-
-    Ties break on document id so the output is deterministic regardless of the
-    input runs' internal ordering.
-    """
+    """reciprocal rank fusion: score(d) = sum_r w_r / (rrf_k + rank_r(d)).
+    rank based so it doesn't care about score-scale mismatch between scorers"""
     if weights is None:
         weights = [1.0] * len(runs)
     fused: Dict[str, float] = {}

@@ -1,24 +1,13 @@
 """
-submission/custom_scorer.py — the Sequential Dependence Model (SDM).
+submission/custom_scorer.py -- Sequential Dependence Model (SDM)
 
-BM25, VSM and query-likelihood assume query terms are independent, so none of
-them can tell "rapid testing" from a document mentioning "rapid" and "testing"
-in unrelated sentences. SDM (Metzler & Croft 2005) adds that as two extra
-feature classes over *adjacent* query term pairs:
+    score(D,Q) = lambda_T * sum f_T(qi, D)              unigrams
+               + lambda_O * sum f_O(qi, qi+1, D)         ordered
+               + lambda_U * sum f_U(qi, qi+1, D)         unordered
 
-    score(D,Q) = lambda_T * sum_i      f_T(q_i, D)              unigrams
-               + lambda_O * sum_i      f_O(q_i, q_i+1, D)       ordered  (#1)
-               + lambda_U * sum_i      f_U(q_i, q_i+1, D)       unordered (#uw8)
-
-Only adjacent pairs -- that's what makes it *sequential* rather than full
-dependence, which would need all 2^n term subsets.
-
-Every f is BM25-saturated so the three feature classes share a scale. Ordered/
-unordered counts come from submission/_proximity.py, computed only over the
-unigram pass's top-N candidates.
-
-Wire this in from submission/retrieve.py's retrieve() instead of calling a
-single scorer directly.
+only adjacent pairs, not full dependence. everything bm25-saturated so
+the 3 feature classes are on the same scale. proximity counts from
+_proximity.py, only computed over top-N unigram candidates
 """
 from typing import List, Optional, Tuple
 
@@ -32,7 +21,6 @@ from submission.indexer import InvertedIndex
 _INDEX: Optional[InvertedIndex] = None
 _STATS: Optional[CollectionStats] = None
 
-# Metzler & Croft's reported defaults. Tuned per collection in practice.
 DEFAULT_LAMBDA_O = 0.10
 DEFAULT_LAMBDA_U = 0.05
 DEFAULT_UW_WIDTH = 8
@@ -40,8 +28,6 @@ DEFAULT_CANDIDATES = 1000
 
 
 def build(index: InvertedIndex) -> None:
-    """Called from retrieve.load_index(), not retrieve.build_index() — the
-    harness runs those two in separate processes."""
     global _INDEX, _STATS
     _INDEX = index
     _STATS = CollectionStats(index.N, index.avg_doc_len, index.total_tokens)
@@ -49,12 +35,7 @@ def build(index: InvertedIndex) -> None:
 
 def _saturate(counts: np.ndarray, doc_lens: np.ndarray, idf: float,
               k1: float, b: float, avgdl: float) -> np.ndarray:
-    """BM25 saturation applied to a proximity count.
-
-    Using the same functional form as the unigram features keeps all three SDM
-    components on a comparable scale, which is what makes the lambda weights
-    mean anything.
-    """
+    """bm25-style saturation applied to a proximity count"""
     norm = k1 * (1.0 - b + b * (doc_lens / avgdl))
     return idf * (counts * (k1 + 1.0)) / (counts + norm)
 
@@ -66,7 +47,6 @@ def score(query: str, k: int,
           uw_width: int = DEFAULT_UW_WIDTH,
           candidates: int = DEFAULT_CANDIDATES,
           pair_max_df_frac: float = 1.0) -> List[Tuple[str, float]]:
-    """Return up to k (doc_id, score) pairs ranked by SDM, best first."""
     if _INDEX is None or _STATS is None:
         raise RuntimeError("custom_scorer.build(index) must be called first")
     index, stats = _INDEX, _STATS
@@ -80,7 +60,7 @@ def score(query: str, k: int,
     lambda_t = 1.0 - lambda_o - lambda_u
     scores = lambda_t * unigram_scores
 
-    # Stage 1: proximity, over the top-N unigram candidates only.
+    # proximity stage, only over top-N unigram candidates
     if (lambda_o or lambda_u) and index.store_positions and len(terms) > 1:
         cand = _top_candidates(unigram_scores, touched, candidates)
         if cand.size:
@@ -93,13 +73,8 @@ def score(query: str, k: int,
             for (term_a, tid_a), (term_b, tid_b) in zip(terms, terms[1:]):
                 if tid_a < 0 or tid_b < 0 or tid_a == tid_b:
                     continue
-                # Skip dependencies involving a term common enough to be
-                # effectively a stopword. These queries are natural-language
-                # questions, so raw adjacency produces pairs like "what is" and
-                # "is the"; treating those as evidence adds noise in proportion
-                # to the lambda weights. Standard SDM is applied to stopped
-                # queries for exactly this reason. Filtering on the MORE common
-                # term means a pair survives only if both halves are specific.
+                # skip pairs where either term is too common (basically a
+                # stopword) -- e.g. "what is" from nl questions, pure noise
                 if max(int(index.df[tid_a]), int(index.df[tid_b])) > df_ceiling:
                     continue
                 idf = _proximity.bigram_idf(
@@ -123,15 +98,13 @@ def score(query: str, k: int,
 
 
 def _unigram_pass(index, stats, query: str, k1: float, b: float):
-    """BM25 over the query terms; also returns resolved (term, term_id) pairs
-    in query order, which the proximity stage needs to form adjacent pairs."""
+    """returns bm25 scores + ordered (term, tid) pairs in query order
+    (needed to form adjacent pairs correctly, not just dedup order)"""
     scorer = _scorers.get("bm25")
     tokens = query_terms(index, query)
     if not tokens:
         return np.zeros(index.N), np.zeros(index.N, dtype=bool), None
 
-    # Adjacency must follow the ORIGINAL query order, not the deduplicated
-    # (term, count) order, or "rapid testing" could be paired wrongly.
     from submission._analysis import analyze
     ordered_terms = [(t, index.term_id(t)) for t in analyze(query, index.config)]
 

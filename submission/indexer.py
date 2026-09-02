@@ -1,23 +1,18 @@
 """
-submission/indexer.py — the inverted index (assignment Section 4.1).
+submission/indexer.py -- the inverted index.
 
-Columnar arrays, not a dict-of-dicts: at 16.3M postings the obvious
-Dict[str, Dict[str, int]] shape costs several GB of pure interpreter overhead,
-which won't fit the 8GB grading machine.
+using flat numpy arrays not dict of dicts, otherwise ~16M postings just
+blow up interpreter memory way past 8gb
 
-    terms[t]           term string, sorted ascending
-    df[t], cf[t]        document / collection frequency
-    docid_off[t:t+2]    byte slice of this term's docids in `_docid_buf`
-    term_start[t]       index of this term's first posting; also its nibble
-                        offset into the packed tf array
-    doc_len[d]           document length in tokens
-    doc_ids[d]           external doc_id string for internal id d
+    terms[t]           term string, sorted
+    df[t], cf[t]        doc / collection freq
+    docid_off[t:t+2]    byte slice in _docid_buf for this term
+    term_start[t]       first posting index for term t
+    doc_len[d]          doc length in tokens
+    doc_ids[d]          external doc_id for internal id d
 
-Postings are delta+VByte encoded (submission/_codecs.py), the whole
-collection in one vectorised call rather than per-term. save()/load() round-
-trip through plain files with no pickling and no shared state between
-processes, and store nothing retrieve() doesn't need -- raw document text is
-never persisted.
+postings are delta + vbyte encoded, whole collection at once not per term.
+save/load are just plain files, no pickling. raw doc text never stored.
 """
 import json
 import multiprocessing
@@ -32,32 +27,20 @@ from submission._analysis import AnalysisConfig, make_analyzer
 from submission._codecs import (pack_tf_nibbles, unpack_tf_nibbles, vbyte_decode,
                                 vbyte_encode, vbyte_widths)
 
-# Below this many documents, splitting across processes costs more (spawn +
-# pickle + merge) than it could ever save. The toy corpus (20 docs) and small
-# test fixtures always take the serial path; this is not a graded corpus size.
+# below this doc count parallel build isn't worth the process overhead
 _PARALLEL_MIN_DOCS = 20_000
 
-# Optional C++ kernel for tokenising and posting emission (see
-# submission/_fastbuild.pyx). Imported behind try/except: without it the build
-# falls back to the pure-Python path and produces the identical index, just
-# more slowly.
+# c++ tokenizer, optional -- falls back to python if it didn't compile
 try:
     from submission import _fastbuild as _FASTBUILD
 except ImportError:  # pragma: no cover - exercised by the fallback test
     _FASTBUILD = None
 
-FORMAT_VERSION = 3   # 3: index files zlib-compressed on disk
+FORMAT_VERSION = 3
 
-# Every index file is deflated on disk. Level 4 from a measured curve, not the
-# default: compression is charged against build time (level 1 -> 22.20MB/0.40s,
-# level 4 -> 21.57MB/0.60s, level 9 -> 21.22MB/7.27s -- not worth it),
-# decompression in load() isn't graded and is ~0.05s regardless of level.
-_ZLIB_LEVEL = 4
+_ZLIB_LEVEL = 4  # measured, higher levels barely shrink but cost build time
 
-# Postings accumulated in Python lists before being flushed to NumPy arrays.
-# Bounds peak interpreter memory during the build without making the flush
-# itself frequent enough to matter.
-_FLUSH_EVERY = 2_000_000
+_FLUSH_EVERY = 2_000_000  # flush python lists to numpy every this many postings
 
 _META = "meta.json"
 _TERMS = "terms.txt"
@@ -75,13 +58,7 @@ _POSITIONS = "positions.bin"
 
 
 def tokenize(text: str) -> List[str]:
-    """Lowercase, alphanumeric-only tokenization.
-
-    Kept as a module-level function under this name for interface
-    compatibility. The configurable chain used by the index itself lives in
-    submission/_analysis.py; this delegates to it with default settings so
-    the two can never drift.
-    """
+    """kept for interface compat, delegates to _analysis so they don't drift"""
     from submission._analysis import analyze
     return analyze(text)
 
@@ -97,15 +74,8 @@ def _iter_jsonl(path: str) -> Iterator[Tuple[str, str]]:
 
 
 def _split_byte_ranges(corpus_path: str, n_workers: int):
-    """Newline-aligned byte offsets splitting the file into `n_workers`
-    roughly-equal pieces, plus each piece's starting internal doc id.
-
-    One sequential pass over line boundaries, not the document content --
-    the file is never materialised in the main process, preserving
-    build_from_jsonl()'s memory-safe streaming property. Internal doc ids
-    must equal file line order (many things assume this), so each worker
-    needs to know exactly how many non-blank lines precede its range.
-    """
+    """newline aligned byte offsets to split the file into n_workers pieces,
+    also figures out each piece's starting doc id (needs a line count pass)"""
     size = os.path.getsize(corpus_path)
     target = size // n_workers
     ranges = []
@@ -119,10 +89,8 @@ def _split_byte_ranges(corpus_path: str, n_workers: int):
             else:
                 seek_to = min(start + target, size)
                 f.seek(seek_to)
-                f.readline()  # consume the partial line; land on a boundary
+                f.readline()  # land on a line boundary
                 end = f.tell()
-            # Count non-blank lines in [start, end) to get the NEXT worker's
-            # doc_id_start -- cheap relative to JSON-decoding the same bytes.
             f.seek(start)
             n_lines = 0
             while f.tell() < end:
@@ -136,22 +104,11 @@ def _split_byte_ranges(corpus_path: str, n_workers: int):
 
 
 def _detected_worker_count() -> int:
-    """Best-effort process-visible CPU count, capped defensively.
-
-    os.cpu_count() reports the HOST's total CPU count, even inside a
-    container whose actual allocation is far smaller -- the grading machine
-    is documented as 4 cores (assignment1.tex Sec. 5), but a real grading
-    run's error log showed OpenBLAS sizing ITS OWN thread pool to 28 (see
-    _detected_worker_count()'s caller): the host's count, not the
-    container's. os.sched_getaffinity(0), where available, respects the
-    process's actual CPU affinity mask, which container CPU limits
-    typically DO set correctly; os.cpu_count() is the fallback where
-    sched_getaffinity doesn't exist (e.g. macOS has no such call). Clamped
-    regardless: this project's own build-time measurements
-    (notes/findings.md) show throughput saturating well under 8 workers, so
-    trusting a much larger raw count buys nothing and only raises the odds
-    of hitting a process/thread ceiling like the one below.
-    """
+    """os.cpu_count() can report the HOST's cpu count inside a container,
+    not what the container is actually limited to -- hit this for real on
+    the grading machine (it spawned way too many workers). use
+    sched_getaffinity where available since it respects the real limit,
+    and cap at 8 regardless since more doesn't help anyway"""
     try:
         n = len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
     except AttributeError:
@@ -160,17 +117,11 @@ def _detected_worker_count() -> int:
 
 
 def _parallel_build_worker(args):
-    """Runs in a separate process: tokenise/stem/intern one byte range of the
-    corpus with its own local Builder, return everything needed to merge.
-
-    Module-level (not a method) because multiprocessing pickles the callable
-    by reference -- a bound method or closure can't cross the process
-    boundary. Returns plain picklable types only (lists, bytes, ndarrays),
-    never an InvertedIndex or a Cython object.
-    """
+    """runs in its own process, tokenises one byte range. module level fn
+    not a method since multiprocessing needs to pickle it by reference"""
     (corpus_path, byte_start, byte_end, doc_id_start, min_token_len,
      max_token_len, stem_tokens, prefix_tokens) = args
-    from submission import _fastbuild as fb  # re-imported: fresh process
+    from submission import _fastbuild as fb  # fresh process, re-import
 
     builder = fb.Builder(min_token_len, max_token_len, stem_tokens)
     doc_ids: List[str] = []
@@ -191,36 +142,26 @@ def _parallel_build_worker(args):
 
     terms_unsorted = builder.terms()
     if not terms_unsorted:
-        # int32 for docs/tfs, matching finish_sorted()'s normal-case dtype
-        # (_fastbuild.pyx) -- np.concatenate upcasts its whole result to
-        # int64 if even one chunk in the list doesn't match, which would
-        # silently defeat _merge_parallel_results()'s int32 path whenever a
-        # worker's byte range happened to be empty.
+        # keep int32 here to match finish_sorted()'s dtype, else concatenate
+        # later silently upcasts everything to int64
         return doc_ids, doc_lens, [], np.zeros(0, dtype=np.int32), \
             np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int64)
 
-    # Identity order: local postings come back in first-seen (unsorted) term
-    # order. The merge step below does the real sort once, globally, rather
-    # than sorting per worker and re-sorting again after the union.
+    # identity order (unsorted, first seen) -- real sort happens once at merge
     identity = np.arange(len(terms_unsorted), dtype=np.int32)
     docs_arr, tfs_arr, df = builder.finish_sorted(identity)
     return doc_ids, doc_lens, terms_unsorted, docs_arr, tfs_arr, df
 
 
 class InvertedIndex:
-    """Inverted index with delta+VByte postings and on-disk persistence."""
+    """inverted index, delta+vbyte postings, on disk persistence"""
 
     def __init__(self, config: Optional[AnalysisConfig] = None,
                  store_positions: bool = False):
         self.config = config or AnalysisConfig()
-        # Positions cost roughly one VByte per token occurrence and are only
-        # needed by proximity/phrase scoring, so they are opt-in: an index built
-        # without them is byte-for-byte what it was before this existed.
-        self.store_positions = store_positions
+        self.store_positions = store_positions  # opt in, only needed for proximity
         self._prefix_tokens = -1
-        # The pseudo-title index shares the main index's document order, so it
-        # does not need its own copy of the external doc-id strings (1.5MB).
-        self.store_doc_ids = True
+        self.store_doc_ids = True  # title index shares main's doc order, doesn't need own copy
         self._pos_buf = np.zeros(0, dtype=np.uint8)
         self._pos_off = np.zeros(1, dtype=np.int64)
         self.terms: List[str] = []
@@ -234,9 +175,6 @@ class InvertedIndex:
         self.avg_doc_len: float = 0.0
         self._docid_buf = np.zeros(0, dtype=np.uint8)
         self._docid_off = np.zeros(1, dtype=np.int64)
-        # Term frequencies are nibble-packed (see submission/_codecs.py). No
-        # per-term offset table is needed: a posting's nibble index is its
-        # posting index, which `_term_start` (cumulative df) already gives.
         self._tf_packed = np.zeros(0, dtype=np.uint8)
         self._tf_exc_idx = np.zeros(0, dtype=np.int64)
         self._tf_exc_val = np.zeros(0, dtype=np.int64)
@@ -246,20 +184,11 @@ class InvertedIndex:
     # Build
     # ------------------------------------------------------------------
     def build(self, corpus: List[Tuple[str, str]]) -> None:
-        """Build from a list of (doc_id, text) pairs.
-
-        This is the signature the starter shipped. For a large corpus prefer
-        `build_from_jsonl()`, which streams instead of materialising every
-        document string in memory first.
-        """
+        """starter signature, prefer build_from_jsonl for big corpora"""
         self._build(iter(corpus))
 
     def build_from_jsonl(self, corpus_path: str, prefix_tokens: int = -1) -> None:
-        """Build by streaming a corpus.jsonl file -- the memory-safe path.
-
-        `prefix_tokens >= 0` indexes only each document's first N tokens, which
-        is how the pseudo-title field is built (see submission/retrieve.py).
-        """
+        """streams the corpus, memory safe. prefix_tokens for the title field"""
         self._prefix_tokens = prefix_tokens
         self._build(_iter_jsonl(corpus_path))
 
@@ -273,29 +202,19 @@ class InvertedIndex:
     def build_from_jsonl_parallel(self, corpus_path: str, prefix_tokens: int = -1,
                                   n_workers: Optional[int] = None,
                                   min_docs: int = _PARALLEL_MIN_DOCS) -> bool:
-        """Split the corpus across up to `n_workers` processes for the
-        per-document tokenise/stem/intern phase. Returns True if it ran (the
-        parallel path was applicable), False if the caller should fall back
-        to `build_from_jsonl()` -- e.g. the C++ builder can't reproduce this
-        analysis chain, or the corpus is too small for splitting to pay for
-        its own overhead.
-
-        Only tokenisation is parallel; postings assembly, encoding and disk
-        writes stay serial regardless (a global, whole-collection step by
-        nature), so this is bounded by Amdahl's law, not a 4x build-time cut.
-        """
+        """splits tokenising across n_workers processes, falls back to
+        build_from_jsonl() if it can't (corpus too small, config not
+        supported by the c++ builder etc). only tokenising is parallel,
+        postings assembly stays serial so don't expect a clean 4x"""
         self._prefix_tokens = prefix_tokens
         if _FASTBUILD is None or not _FASTBUILD.Builder.supports(self.config):
             return False
         if self.store_positions:
-            return False  # not supported by the fast path at all, parallel or not
+            return False
 
         n_workers = n_workers or _detected_worker_count()
         size = os.path.getsize(corpus_path)
-        approx_docs = size // 200  # ~200 bytes/doc average on this corpus; a
-        # cheap upper-bound estimate to gate on, not an exact count -- getting
-        # this wrong only costs "did we parallelise a corpus that was too
-        # small to benefit", never correctness.
+        approx_docs = size // 200  # rough estimate, just for the gate check
         if n_workers < 2 or approx_docs < min_docs:
             return False
 
@@ -305,27 +224,16 @@ class InvertedIndex:
                  self.config.stemmer == "porter", prefix_tokens)
                 for start, end, doc_id_start in ranges]
 
-        # Each spawned worker re-imports numpy fresh (spawn re-imports
-        # everything), and numpy's BLAS backend sizes ITS OWN internal
-        # thread pool from the visible CPU count too -- with n_workers
-        # processes each also spinning up that many BLAS threads, a real
-        # grading run hit `pthread_create failed ... Resource temporarily
-        # unavailable` inside OpenBLAS's own init, partway through numpy's
-        # import, before any of this project's code had run at all.
-        # Multiprocessing is already the parallelism here; BLAS threading
-        # inside each worker is pure redundant oversubscription on top of
-        # it. Setting these here, in the parent, propagates through
-        # process creation to each child's environment (spawn inherits the
-        # environment at Process-creation time) without affecting the
-        # BLAS thread pool this process itself already initialised when it
-        # first imported numpy -- that's sized once, at import time, so a
-        # later env var change here has no retroactive effect on it.
+        # each worker re-imports numpy fresh and its BLAS backend spins up
+        # its own thread pool sized off visible cpu count -- combined with
+        # n_workers processes this actually crashed on the grading machine
+        # (pthread_create failing). force BLAS single threaded in workers,
+        # multiprocessing is already doing the parallelism
         for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS",
                     "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
             os.environ[_var] = "1"
 
-        ctx = multiprocessing.get_context("spawn")  # portable; fork is unsafe
-        # to rely on once the parent has imported a compiled extension.
+        ctx = multiprocessing.get_context("spawn")  # fork unsafe w/ compiled ext loaded
         with ctx.Pool(processes=n_workers) as pool:
             results = pool.map(_parallel_build_worker, tasks)
 
@@ -333,15 +241,9 @@ class InvertedIndex:
         return True
 
     def _merge_parallel_results(self, results) -> None:
-        """Union each worker's local vocabulary into one global sorted one,
-        remap postings, and concatenate per term in worker-rank order.
-
-        Concatenation (not a k-way merge) is correct because each worker's
-        doc-id range is contiguous, non-overlapping, and increases with
-        worker rank -- worker 0's documents all precede worker 1's, etc. --
-        so a term's postings are already doc-id-ascending within one worker
-        and stay ascending when workers are joined in rank order.
-        """
+        """union each worker's vocab, remap, concat in worker order.
+        concat works (no k-way merge needed) since each worker's doc range
+        is contiguous and non overlapping"""
         doc_ids: List[str] = []
         doc_lens: List[int] = []
         for w_doc_ids, w_doc_lens, _terms, _d, _t, _df in results:
@@ -365,9 +267,6 @@ class InvertedIndex:
         global_index = {t: i for i, t in enumerate(sorted_terms)}
         n_global = len(sorted_terms)
 
-        # Per worker: local term_start offsets (into its own docs/tfs arrays)
-        # and local-index -> global-index, so a global term's contribution
-        # from this worker can be sliced out directly.
         per_worker = []
         for _di, _dl, terms, docs_arr, tfs_arr, df in results:
             local_start = self._term_starts(df) if df.size else np.zeros(0, dtype=np.int64)
@@ -378,9 +277,7 @@ class InvertedIndex:
         docs_chunks: List[np.ndarray] = []
         tfs_chunks: List[np.ndarray] = []
         df_final = np.zeros(n_global, dtype=np.int64)
-        # Global-to-local lookup per worker (-1 = this worker never saw the
-        # term), built once so the term loop below is O(1) per worker.
-        inv_maps = []
+        inv_maps = []  # global->local per worker, -1 = worker never saw it
         for docs_arr, tfs_arr, df, local_start, g_of_l in per_worker:
             inv = np.full(n_global, -1, dtype=np.int64)
             if g_of_l.size:
@@ -398,13 +295,7 @@ class InvertedIndex:
                 tfs_chunks.append(tfs_arr[s:e])
                 df_final[g] += (e - s)
 
-        # int32, matching finish_sorted()'s own return dtype (_fastbuild.pyx):
-        # docs_chunks/tfs_chunks are views into each worker's int32 arrays, so
-        # concatenating them is already int32 in the common case; only the
-        # dtype= here matters for the (unreachable in practice -- all_terms
-        # non-empty implies at least one chunk) empty fallback, kept
-        # consistent so concatenate never has to upcast the real case to
-        # match a mismatched empty-array dtype.
+        # int32 to match finish_sorted()'s dtype
         docs_arr = (np.concatenate(docs_chunks) if docs_chunks
                    else np.zeros(0, dtype=np.int32))
         tfs_arr = (np.concatenate(tfs_chunks) if tfs_chunks
@@ -415,28 +306,19 @@ class InvertedIndex:
         self.df = df_final
         self.cf = np.zeros(n_global, dtype=np.int64)
         if docs_arr.size:
-            # reduceat's out= safely upcasts int32 -> int64 during
-            # accumulation; casting the input first would just allocate a
-            # redundant total-postings-sized copy (F51, notes/findings.md).
+            # reduceat's out= upcasts int32->int64 automatically, no need
+            # to cast the input first (would just allocate a big extra copy)
             np.add.reduceat(tfs_arr, self._term_starts(df_final), out=self.cf)
         self._encode_postings(docs_arr, tfs_arr)
 
     def _build_counts_fast(self, docs: Iterable[Tuple[str, str]]) -> None:
-        """Same index as `_build_counts`, with tokenising and posting emission
-        done in C++ (see submission/_fastbuild.pyx).
-
-        Used only when the analysis chain is the default one the kernel
-        reproduces exactly; any other configuration falls back to Python rather
-        than risking a silently different index.
-        """
+        """same as _build_counts but tokenising done in c++"""
         builder = _FASTBUILD.Builder(self.config.min_token_len, self.config.max_token_len,
                                      self.config.stemmer == "porter")
         doc_ids: List[str] = []
         doc_lens: List[int] = []
         for internal_id, (ext_id, text) in enumerate(docs):
             doc_ids.append(ext_id)
-            # str.lower() stays in Python: it is already C-speed and applies the
-            # full Unicode case mapping the byte scanner cannot.
             doc_lens.append(builder.add_document(
                 text.lower().encode("utf-8"), internal_id, self._prefix_tokens))
 
@@ -451,9 +333,7 @@ class InvertedIndex:
             self._finalise_empty({})
             return
 
-        # Sort the vocabulary, then have the kernel concatenate postings in that
-        # order. This replaces the 16.3M-element np.lexsort the document-ordered
-        # layout required -- 3.06s of a 5.78s build -- with a single copy pass.
+        # sort vocab, let kernel emit postings already in that order
         order = sorted(range(len(terms_unsorted)), key=terms_unsorted.__getitem__)
         sorted_terms = [terms_unsorted[i] for i in order]
         docs_arr, tfs_arr, df = builder.finish_sorted(np.asarray(order, dtype=np.int32))
@@ -462,31 +342,20 @@ class InvertedIndex:
         self.term_lookup = {term: i for i, term in enumerate(sorted_terms)}
         self.df = df
         self.cf = np.zeros(len(sorted_terms), dtype=np.int64)
-        # docs_arr/tfs_arr come back from finish_sorted() as int32 already
-        # (submission/_fastbuild.pyx); reduceat's out= safely upcasts during
-        # accumulation, so casting the input up first would only allocate a
-        # redundant total-postings-sized int64 copy for no benefit (F51).
         np.add.reduceat(tfs_arr, self._term_starts(df), out=self.cf)
         self._encode_postings(docs_arr, tfs_arr)
 
     @staticmethod
     def _term_starts(df: np.ndarray) -> np.ndarray:
-        """Index of each term's first posting. Every term has df >= 1, so the
-        cumulative document frequency gives this directly."""
         starts = np.empty(df.size, dtype=np.int64)
         starts[0] = 0
         np.cumsum(df[:-1], out=starts[1:])
         return starts
 
     def _encode_postings(self, post_doc: np.ndarray, post_tf: np.ndarray) -> None:
-        """Delta+VByte encode postings that are already grouped by term and
-        ascending by doc id within each term."""
+        """delta+vbyte encode postings, already grouped by term + doc asc"""
         term_start = self._term_starts(self.df)
-        # int32, not int64: a doc-id delta is bounded by self.N, nowhere near
-        # int32's ~2.1 billion ceiling even at the "larger collection" scale
-        # the held-out evaluation uses (assignment1.tex Sec. 3). This is a
-        # total-postings-sized array (16.3M+ at the dev corpus), so this is
-        # the single biggest lever in this function (see F51, notes/findings.md).
+        # int32 not int64, doc id delta bounded by self.N anyway, saves a lot
         gaps = np.empty(post_doc.size, dtype=np.int32)
         gaps[0] = post_doc[0]
         np.subtract(post_doc[1:], post_doc[:-1], out=gaps[1:])
@@ -499,13 +368,7 @@ class InvertedIndex:
         self._tf_packed, self._tf_exc_idx, self._tf_exc_val = pack_tf_nibbles(post_tf)
 
     def _build_positional(self, docs: Iterable[Tuple[str, str]]) -> None:
-        """Build with term positions retained, for proximity/phrase scoring.
-
-        Emits one (term, doc, position) triple per token occurrence and
-        recovers tf by grouping, so a posting's tf is exactly how many
-        positions it owns -- no separate offset table needed for the
-        positions file.
-        """
+        """same as _build_counts but keeps term positions for proximity/SDM"""
         analyzer = make_analyzer(self.config)
         provisional: Dict[str, int] = {}
         doc_ids: List[str] = []
@@ -565,16 +428,14 @@ class InvertedIndex:
             remap[provisional[term]] = new_id
         term_ids = remap[term_ids]
 
-        # Group by term, then doc, then position ascending.
-        order = np.lexsort((positions, docs_arr, term_ids))
+        order = np.lexsort((positions, docs_arr, term_ids))  # sort by term, doc, pos
         term_ids = term_ids[order]
         docs_arr = docs_arr[order]
         positions = positions[order]
         del order
 
         n_tokens = term_ids.size
-        # A new posting begins wherever (term, doc) changes.
-        is_new = np.empty(n_tokens, dtype=bool)
+        is_new = np.empty(n_tokens, dtype=bool)  # new posting where (term,doc) changes
         is_new[0] = True
         np.logical_or(term_ids[1:] != term_ids[:-1], docs_arr[1:] != docs_arr[:-1], out=is_new[1:])
         posting_start = np.flatnonzero(is_new)
@@ -604,23 +465,21 @@ class InvertedIndex:
         self._term_start = term_start
         self._tf_packed, self._tf_exc_idx, self._tf_exc_val = pack_tf_nibbles(post_tf)
 
-        # Positions delta-encoded within each posting (they are ascending there),
-        # restarting the chain at every posting boundary.
+        # positions delta encoded within each posting, restart at each boundary
         pos_gaps = np.empty(n_tokens, dtype=np.int64)
         pos_gaps[0] = positions[0]
         np.subtract(positions[1:], positions[:-1], out=pos_gaps[1:])
         pos_gaps[posting_start] = positions[posting_start]
 
-        # Each term's slice of the position buffer starts at its first posting.
         pos_term_start = posting_start[term_start]
         pos_bytes = np.add.reduceat(vbyte_widths(pos_gaps), pos_term_start)
         self._pos_buf = vbyte_encode(pos_gaps)
         self._pos_off = np.concatenate(([0], np.cumsum(pos_bytes))).astype(np.int64)
 
     def _build_counts(self, docs: Iterable[Tuple[str, str]]) -> None:
-        analyzer = make_analyzer(self.config)  # holds the stem cache across docs
+        analyzer = make_analyzer(self.config)  # keeps stem cache warm across docs
 
-        provisional: Dict[str, int] = {}     # term -> first-seen id
+        provisional: Dict[str, int] = {}
         doc_ids: List[str] = []
         doc_lens: List[int] = []
 
@@ -647,8 +506,7 @@ class InvertedIndex:
                 tokens = tokens[:self._prefix_tokens]
             doc_ids.append(ext_id)
             doc_lens.append(len(tokens))
-            # Counter preserves first-seen order, so this loop is deterministic.
-            for term, tf in Counter(tokens).items():
+            for term, tf in Counter(tokens).items():  # Counter keeps first-seen order
                 tid = provisional.get(term)
                 if tid is None:
                     tid = len(provisional)
@@ -675,16 +533,13 @@ class InvertedIndex:
         tfs_arr = np.concatenate([c[2] for c in chunks])
         del chunks
 
-        # Reassign term ids so they follow alphabetical order. Sorting the terms
-        # makes the dictionary compressible (shared prefixes end up adjacent)
-        # and makes the build deterministic regardless of corpus order.
         self._finalise_postings(list(provisional), term_ids, docs_arr, tfs_arr,
                                 first_seen=provisional)
 
     def _finalise_postings(self, seen_terms, term_ids, docs_arr, tfs_arr,
                            first_seen=None) -> None:
-        """Sort, group and encode postings. Shared by the Python and C++ paths
-        so both produce a byte-identical index."""
+        """sort, group, encode. shared by python + c++ paths so both give
+        byte identical index"""
         provisional = first_seen if first_seen is not None else {
             t: i for i, t in enumerate(seen_terms)}
         sorted_terms = sorted(provisional)
@@ -693,9 +548,7 @@ class InvertedIndex:
             remap[provisional[term]] = new_id
         term_ids = remap[term_ids]
 
-        # Group by term, ascending docid within each term. lexsort's LAST key is
-        # primary, so this is "sort by term, then by doc".
-        order = np.lexsort((docs_arr, term_ids))
+        order = np.lexsort((docs_arr, term_ids))  # sort by term then doc
         term_ids = term_ids[order]
         docs_arr = docs_arr[order]
         tfs_arr = tfs_arr[order]
@@ -707,19 +560,15 @@ class InvertedIndex:
         self.df = np.bincount(term_ids, minlength=n_terms).astype(np.int64)
         self.cf = np.bincount(term_ids, weights=tfs_arr, minlength=n_terms).astype(np.int64)
 
-        # Every term has df >= 1, so cumulative df gives each term's first
-        # posting index directly.
         starts = np.empty(n_terms, dtype=np.int64)
         starts[0] = 0
         np.cumsum(self.df[:-1], out=starts[1:])
 
-        # Delta-encode docids, restarting the gap chain at each term boundary.
         gaps = np.empty(docs_arr.size, dtype=np.int64)
         gaps[0] = docs_arr[0]
         np.subtract(docs_arr[1:], docs_arr[:-1], out=gaps[1:])
         gaps[starts] = docs_arr[starts]
 
-        # Per-term byte lengths, computed without encoding term-by-term.
         docid_bytes = np.add.reduceat(vbyte_widths(gaps), starts)
         self._docid_buf = vbyte_encode(gaps)
         self._docid_off = np.concatenate(([0], np.cumsum(docid_bytes))).astype(np.int64)
@@ -740,33 +589,24 @@ class InvertedIndex:
     # Query-time accessors
     # ------------------------------------------------------------------
     def term_id(self, term: str) -> int:
-        """Internal id for `term`, or -1 if it is not in the vocabulary."""
         return self.term_lookup.get(term, -1)
 
     def document_frequency(self, term: str) -> int:
-        """Number of documents containing `term` at least once."""
         tid = self.term_lookup.get(term)
         return int(self.df[tid]) if tid is not None else 0
 
     def collection_frequency(self, term: str) -> int:
-        """Total occurrences of `term` across the whole collection."""
         tid = self.term_lookup.get(term)
         return int(self.cf[tid]) if tid is not None else 0
 
     def postings(self, term: str) -> Tuple[np.ndarray, np.ndarray]:
-        """Decode `term`'s postings list.
-
-        Returns (doc_ids, term_frequencies) as parallel arrays with doc_ids
-        ascending -- internal integer ids, not external strings. Returns empty
-        arrays for an unknown term.
-        """
+        """(doc_ids, tfs) parallel arrays, doc_ids ascending, internal ids"""
         tid = self.term_lookup.get(term)
         if tid is None:
             return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
         return self.postings_by_id(tid)
 
     def postings_by_id(self, tid: int) -> Tuple[np.ndarray, np.ndarray]:
-        """`postings()` for an already-resolved term id."""
         count = int(self.df[tid])
         gaps = vbyte_decode(self._docid_buf[self._docid_off[tid]:self._docid_off[tid + 1]], count)
         tfs = unpack_tf_nibbles(self._tf_packed, int(self._term_start[tid]), count,
@@ -774,13 +614,8 @@ class InvertedIndex:
         return np.cumsum(gaps), tfs
 
     def postings_with_positions(self, tid: int):
-        """Decode a term's postings together with its term positions.
-
-        Returns (doc_ids, tfs, positions, offsets) where `positions` is the flat
-        concatenation of every posting's position list and `offsets[i]` is where
-        document i's positions begin. tf doubles as the per-posting length, so
-        no separate offset table is stored on disk.
-        """
+        """(doc_ids, tfs, positions, offsets). tf doubles as per-posting
+        position count so no separate offset table needed on disk"""
         if not self.store_positions:
             raise RuntimeError("this index was built without positions")
         doc_ids, tfs = self.postings_by_id(tid)
@@ -790,8 +625,6 @@ class InvertedIndex:
         offsets = np.empty(tfs.size, dtype=np.int64)
         offsets[0] = 0
         np.cumsum(tfs[:-1], out=offsets[1:])
-        # Undo the per-posting delta chains: cumulative sum, minus each
-        # posting's running base.
         running = np.cumsum(gaps)
         base = np.zeros(tfs.size, dtype=np.int64)
         base[1:] = running[offsets[1:] - 1]
@@ -813,13 +646,9 @@ class InvertedIndex:
     def _read_blob(path: str) -> bytes:
         with open(path, "rb") as f:
             return zlib.decompress(f.read())
-    def save(self, index_dir: str) -> None:
-        """Persist everything `retrieve()` needs, and nothing else.
 
-        Deliberately omits raw document text: BM25, VSM and the LM/DFR scorers
-        need only term-frequency and length statistics, and storing 189MB of
-        text would wreck the index-size component for zero query-time benefit.
-        """
+    def save(self, index_dir: str) -> None:
+        """writes everything retrieve() needs, nothing else. no raw text"""
         os.makedirs(index_dir, exist_ok=True)
 
         meta = {
@@ -836,18 +665,13 @@ class InvertedIndex:
         with open(os.path.join(index_dir, _META), "w", encoding="utf-8") as f:
             json.dump(meta, f)
 
-        # The tokenizer emits [a-z0-9]+ only, and external doc_ids in this
-        # collection carry no newlines, so newline framing is unambiguous.
         self._write_blob(os.path.join(index_dir, _TERMS),
                          "\n".join(self.terms).encode("utf-8"))
         if self.store_doc_ids:
             self._write_blob(os.path.join(index_dir, _DOCIDS),
                              "\n".join(self.doc_ids).encode("utf-8"))
 
-        # Per-term byte lengths rather than absolute offsets: the lengths are
-        # small integers that VByte to ~1 byte, while absolute offsets grow to
-        # 4-5 bytes each. Reconstructed by cumsum at load.
-        docid_len = np.diff(self._docid_off)
+        docid_len = np.diff(self._docid_off)  # per-term lengths, not offsets, vbytes smaller
 
         for name, arr in (
             (_DF, self.df),
@@ -859,7 +683,6 @@ class InvertedIndex:
 
         self._write_blob(os.path.join(index_dir, _POSTINGS_D), self._docid_buf.tobytes())
         self._write_blob(os.path.join(index_dir, _TF_NIB), self._tf_packed.tobytes())
-        # Exception positions are ascending, so gap-encode them like doc ids.
         exc_gaps = np.diff(self._tf_exc_idx, prepend=0) if self._tf_exc_idx.size else self._tf_exc_idx
         self._write_blob(os.path.join(index_dir, _TF_EXC_I), vbyte_encode(exc_gaps).tobytes())
         self._write_blob(os.path.join(index_dir, _TF_EXC_V), vbyte_encode(self._tf_exc_val).tobytes())
@@ -871,7 +694,7 @@ class InvertedIndex:
 
     @classmethod
     def load(cls, index_dir: str) -> "InvertedIndex":
-        """Reconstruct an index from `index_dir` alone, in a fresh process."""
+        """rebuild from index_dir alone, fresh process"""
         with open(os.path.join(index_dir, _META), "r", encoding="utf-8") as f:
             meta = json.load(f)
         if meta.get("format_version") != FORMAT_VERSION:

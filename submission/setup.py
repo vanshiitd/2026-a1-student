@@ -1,30 +1,15 @@
 """
-submission/setup.py — builds the optional compiled extensions.
+submission/setup.py -- builds the cython extensions.
 
-Location and working directory are dictated by the grading harness: staff run
-
+run from inside submission/ (grading harness cds here first):
     cd submission && python setup.py build_ext --inplace
 
-so every path here is relative to submission/, not the repo root.
+module names kept bare (_fast not submission._fast) so --inplace puts the
+.so right next to the .pyx, which is where the import expects it.
 
-The module names are deliberately bare (`_fast`, not `submission._fast`).
-With `--inplace` run from inside this directory, a bare name puts the built
-`.so` alongside the `.pyx` -- i.e. at submission/_fast.…so, which is exactly
-where `from submission import _fast` looks for it. A dotted name here would
-nest the output at submission/submission/_fast.…so instead, and the import
-would fail while the build still "succeeded".
-
-The extension in submission/_fast.pyx fuses VByte decoding with BM25 scoring;
-profiling put 90% of query time in the phases it replaces. It is strictly an
-optimisation: every caller imports it behind try/except and falls back to a
-pure-Python path, so a submission where this fails to build still runs correctly
-(just slower).
-
-Built at image-build time, never inside build_index() -- anything build_index()
-does is charged against the index-build-time efficiency metric, and a one-time
-compile is not indexing work.
-
-    cd submission && python setup.py build_ext --inplace
+both are pure speedups, everything falls back to pure python/numpy if
+these don't compile. built at image-build time not in build_index() since
+that would count against build-time efficiency
 """
 from setuptools import Extension, setup
 
@@ -48,15 +33,9 @@ extensions = [
         "_fast",
         sources=["_fast.pyx"],
         include_dirs=[np.get_include()],
-        # -O3 for speed, but two float-safety flags are mandatory:
-        #   -ffast-math      would permit reassociation of float operations.
-        #   -ffp-contract=off stops the compiler fusing `a*b + c` into a single
-        #                    FMA instruction, which rounds ONCE instead of twice
-        #                    and so produces different (not wrong, but different)
-        #                    results from NumPy.
-        # Without the second flag the kernel diverged from the NumPy path on the
-        # full corpus while still passing on a small fixture -- caught only by
-        # comparing full-corpus rankings.
+        # -ffp-contract=off matters -- without it the compiler fuses a*b+c
+        # into one FMA which rounds differently than numpy, diverged on the
+        # full corpus once even though a small test still passed
         extra_compile_args=["-O3", "-ffp-contract=off"],
         define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
     )

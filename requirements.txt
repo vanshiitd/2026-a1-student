@@ -1,42 +1,24 @@
-# Core (needed to run the harness and the shipped trivial baseline)
+# core, needed for the harness
 pytest>=7.0
 
-# Required by submission/ — the index, codecs and scorers are all vectorised.
-# Explicitly permitted by the assignment (Section 1.2, "numerical libraries
-# (NumPy)"). Listed explicitly rather than relied on as a transitive dependency
-# of ir_datasets: ir_datasets is only needed for corpus download, which the
-# grading image has no reason to install.
+# submission/ is all vectorised numpy
 numpy>=1.24
 
-# Porter stemmer for the analysis chain. Explicitly permitted by the assignment
-# (Section 1.2, "standard libraries for tokenisation/stemming (e.g., NLTK's
-# Porter stemmer)"). NLTK's PorterStemmer is purely algorithmic and needs no
-# downloaded nltk_data corpora, which matters because the grading container runs
-# with networking disabled.
+# porter stemmer, purely algorithmic, no nltk_data download needed (matters
+# since grading has no network)
 nltk>=3.8
 
-# Available if you want to compile part of your submission as a C/C++
-# extension (e.g. via Cython) for the efficiency / index-size leaderboard
-# components — see docs/SUBMISSION_INTERFACE.md, "Compiled extensions".
-# Not required if you stay in pure Python; the provided Docker image has
-# the C/C++ toolchain (build-essential) needed to build it either way.
-# Using pybind11 instead of Cython is also fine — add it here yourself.
+# for the optional cython extension
 Cython>=3.0
 
-# Needed to compile the Cython extension at image-build time. python:*-slim
-# images do not always ship setuptools, and without it `setup.py build_ext`
-# cannot run in the grading image.
+# needed to compile the extension, python slim images don't always ship it
 setuptools>=68.0
 
-# Needed only for scripts/download_full_corpus.py (fetching the real
-# assignment corpus). Not required to run the toy set or the harness itself.
+# only for scripts/download_full_corpus.py
 ir_datasets>=0.5.5
 
-# Needed only for harness/generate_baseline.py (regenerating the
-# reference BM25 "beat this" run file). A precomputed run file is already
-# shipped in data/toy/, so most students will never need to run this.
+# only for harness/generate_baseline.py
 rank_bm25>=0.2.2
 
-# Optional: if you want to cross-check this harness's metrics against the
-# standard TREC tool. Not required.
+# optional, cross check against trec_eval
 # pytrec_eval>=0.5

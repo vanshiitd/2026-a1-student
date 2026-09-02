@@ -1,18 +1,11 @@
 """
-submission/boolean_vsm.py — Boolean retrieval + vector-space ranking
-(assignment Section 4.1).
+submission/boolean_vsm.py -- boolean AND/OR + tf-idf cosine VSM
 
-1. Boolean: AND/OR combination of query terms, set membership only, no
-   ranking.
-2. VSM: TF-IDF weighted cosine similarity --
+    w(t, d)   = tf(t, d) * log( N / df(t) )
+    sim(q, d) = (q . d) / (||q|| * ||d||)
 
-       w(t, d)   = tf(t, d) * log( N / df(t) )
-       sim(q, d) = (q . d) / (||q|| * ||d||)
-
-Both read the same InvertedIndex from indexer.py. ||d|| needs every term in a
-document, not just the query terms, so it's computed once over the whole
-postings file and cached (see `_document_norms()`), deferred until the first
-`vsm_score()` call so a BM25-only run never pays for it.
+doc norms are expensive (need every term not just query terms) so cached
+and computed lazily on first vsm_score() call
 """
 from collections import Counter
 from typing import List, Optional, Tuple
@@ -28,11 +21,6 @@ _DOC_NORMS: Optional[np.ndarray] = None
 
 
 def build(index: InvertedIndex) -> None:
-    """Bind the index, and drop any cached norms from a previous index.
-
-    Called from retrieve.load_index(), not retrieve.build_index() -- the harness
-    runs those in separate processes.
-    """
     global _INDEX, _DOC_NORMS
     _INDEX = index
     _DOC_NORMS = None
@@ -45,24 +33,13 @@ def _require_index() -> InvertedIndex:
 
 
 def _idf(df: np.ndarray, n_docs: int) -> np.ndarray:
-    """w(t,d)'s IDF factor: log(N / df).
-
-    df >= 1 for every term in the dictionary, so this is finite; a term matching
-    every document scores log(1) = 0, which is the intended behaviour.
-    """
     return np.log(n_docs / np.maximum(df, 1))
 
 
 def _decode_all_postings(index: InvertedIndex) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Decode the entire postings file in one vectorised pass.
-
-    Returns (term_id, doc_id, tf) parallel arrays covering every posting.
-
-    Doing this term-by-term would mean ~200K NumPy calls; instead both buffers
-    are decoded whole. The only subtlety is that document-id gaps restart at
-    each term boundary, so a single global cumsum overshoots -- corrected by
-    subtracting each term's running offset, computed vectorised below.
-    """
+    """decode whole postings file at once (not term by term, too slow).
+    doc-id gaps restart per term so need to subtract each term's running
+    offset after the global cumsum"""
     n_terms = len(index.terms)
     total = int(index.df.sum())
     if total == 0:
@@ -80,7 +57,6 @@ def _decode_all_postings(index: InvertedIndex) -> Tuple[np.ndarray, np.ndarray, 
     np.cumsum(index.df[:-1], out=starts[1:])
 
     running = np.cumsum(gaps)
-    # Value of the running sum just before each term's first posting.
     base = np.zeros(n_terms, dtype=np.int64)
     base[1:] = running[starts[1:] - 1]
     doc_ids = running - np.repeat(base, index.df)
@@ -89,7 +65,6 @@ def _decode_all_postings(index: InvertedIndex) -> Tuple[np.ndarray, np.ndarray, 
 
 
 def _document_norms() -> np.ndarray:
-    """||d|| for every document, computed once and cached."""
     global _DOC_NORMS
     index = _require_index()
     if _DOC_NORMS is not None:
@@ -107,20 +82,13 @@ def _document_norms() -> np.ndarray:
 
 
 def boolean_search(query: str, mode: str = "and") -> List[str]:
-    """Return the (unranked) list of doc_ids matching `query`, treating it
-    as a conjunction (`mode="and"`) or disjunction (`mode="or"`) of its
-    terms.
-
-    Results are returned in ascending internal document order (i.e. the order
-    build_index() saw them), which is arbitrary but deterministic. An unknown
-    term makes an AND query empty and contributes nothing to an OR query.
-    """
+    """unranked doc_ids matching the query as AND/OR of its terms"""
     index = _require_index()
     mode = mode.lower()
     if mode not in ("and", "or"):
         raise ValueError(f"mode must be 'and' or 'or', got {mode!r}")
 
-    terms = list(dict.fromkeys(analyze(query, index.config)))  # dedup, keep order
+    terms = list(dict.fromkeys(analyze(query, index.config)))
     if not terms:
         return []
 
@@ -129,7 +97,7 @@ def boolean_search(query: str, mode: str = "and") -> List[str]:
         doc_ids, _tfs = index.postings(term)
         if mode == "and":
             if doc_ids.size == 0:
-                return []  # a missing term empties the conjunction
+                return []
             result = doc_ids if result is None else np.intersect1d(result, doc_ids, assume_unique=True)
             if result.size == 0:
                 return []
@@ -142,8 +110,6 @@ def boolean_search(query: str, mode: str = "and") -> List[str]:
 
 
 def vsm_score(query: str, k: int) -> List[Tuple[str, float]]:
-    """Return up to k (doc_id, score) pairs for `query`, ranked by
-    TF-IDF cosine similarity, highest score first."""
     index = _require_index()
     if k <= 0:
         return []
@@ -159,7 +125,7 @@ def vsm_score(query: str, k: int) -> List[Tuple[str, float]]:
     for term, qtf in query_tf.items():
         tid = index.term_id(term)
         if tid < 0:
-            continue  # out-of-vocabulary: contributes to neither vector
+            continue
         df = int(index.df[tid])
         idf = float(np.log(index.N / max(df, 1)))
         q_weight = qtf * idf
@@ -181,7 +147,6 @@ def vsm_score(query: str, k: int) -> List[Tuple[str, float]]:
         where=denom > 0,
     )
 
-    # Deterministic tie-break on ascending internal document id, including at
-    # the k-th/(k+1)-th boundary where argpartition would choose arbitrarily.
+    # tie break on doc id so argpartition ties don't get arbitrary order
     order = np.lexsort((candidates, -cand_scores))[:k]
     return [(index.doc_ids[int(candidates[i])], float(cand_scores[i])) for i in order]

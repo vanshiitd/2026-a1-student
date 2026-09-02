@@ -3,24 +3,11 @@
 # cython: boundscheck=False
 # cython: wraparound=False
 """
-submission/_fastbuild.pyx — tokenisation and posting emission in C++.
-
-Phase-timing put 69% of the build in tokenisation, Counter + ~16.3M list
-appends, and converting those lists to NumPy arrays -- because every one of
-~29M tokens became a Python str object just to be looked up in the vocabulary
-dict. Here tokens stay as raw bytes, interned through a C++
-unordered_map<string, int>, so no Python object is created per token.
-
-Per-document term frequencies are counted in an O(1) scratch vector indexed
-by term id, with a touched-list to reset only what was used.
-
-`text.lower()` stays in Python (already C-speed, handles Unicode case
-mapping) before this scans the UTF-8 bytes for [a-z0-9]+ runs -- UTF-8
-continuation bytes are all >= 0x80 so can never be mistaken for ASCII
-alphanumerics, meaning this produces exactly the tokens Python's `re` would.
-
-Only the default analysis chain is supported; `Builder.supports()` reports
-that, and the caller falls back to Python for anything else.
+submission/_fastbuild.pyx -- tokenising + posting emission in c++, way
+faster than python since tokens never become python str objects. also has
+a c++ port of nltk's porter stemmer (NLTK_EXTENSIONS mode). only supports
+the default analysis chain, Builder.supports() checks that and caller
+falls back to python otherwise
 """
 
 import numpy as np
@@ -39,20 +26,7 @@ cdef inline bint _is_token_byte(unsigned char c) noexcept nogil:
     return (c >= b'a' and c <= b'z') or (c >= b'0' and c <= b'9')
 
 
-# ---------------------------------------------------------------------------
-# Porter stemmer (nltk's NLTK_EXTENSIONS mode), ported to C++.
-#
-# A direct structural port of nltk.stem.porter.PorterStemmer -- same function
-# names, same step order, same control flow -- so it can be reviewed against
-# the reference line-for-line. Only NLTK_EXTENSIONS is implemented: it is
-# nltk's own default and the only mode submission/_analysis.py uses
-# (PorterStemmer() with no mode argument).
-#
-# Correctness bar: every token this corpus's tokenizer can produce ([a-z0-9]+,
-# already lowercase, so no .lower() step is needed here) must stem identically
-# to NLTK's own stem() -- exhaustively verified against the full corpus
-# vocabulary, not spot-checked. See tests/test_porter_equivalence.py.
-# ---------------------------------------------------------------------------
+# porter stemmer below, ported from nltk.stem.porter, same steps same order
 from libcpp.unordered_map cimport unordered_map as _umap
 
 
@@ -61,13 +35,8 @@ cdef inline bint _is_vowel(char c) noexcept nogil:
 
 
 cdef void _consonant_flags(const string& word, vector[bint]& flags) noexcept nogil:
-    """flags[i] = True iff word[i] is a consonant, single left-to-right pass.
-
-    A 'y' is a consonant iff the preceding letter is not one (or it starts
-    the word) -- exactly the previous flag. This is nltk's own justification
-    for computing all flags in one O(n) pass rather than a per-index
-    backward walk over runs of 'y': the two are provably equivalent.
-    """
+    """flags[i] = is word[i] a consonant. y is consonant unless prev
+    letter also is (same as nltk's rule)"""
     cdef Py_ssize_t n = <Py_ssize_t>word.size()
     cdef Py_ssize_t i
     cdef char c
@@ -86,7 +55,7 @@ cdef void _consonant_flags(const string& word, vector[bint]& flags) noexcept nog
 
 
 cdef int _measure(const string& word) noexcept nogil:
-    """Porter's m: count of vowel-then-consonant transitions."""
+    """porter's m, count vowel->consonant transitions"""
     cdef vector[bint] flags
     _consonant_flags(word, flags)
     cdef Py_ssize_t i, n = <Py_ssize_t>flags.size()
@@ -125,7 +94,7 @@ cdef bint _ends_double_consonant(const string& word) noexcept nogil:
 
 
 cdef bint _ends_cvc(const string& word) noexcept nogil:
-    """NLTK_EXTENSIONS mode: the len==2 special case is always active."""
+    """nltk extensions mode: len==2 special case always active"""
     cdef Py_ssize_t n = <Py_ssize_t>word.size()
     if n >= 3:
         if (_is_consonant_at(word, n - 3) and not _is_consonant_at(word, n - 2)
@@ -221,9 +190,7 @@ cdef string _step1c(const string& word) noexcept nogil:
 
 cdef string _step2(const string& word) noexcept nogil:
     cdef string check_stem
-    # NLTK-only pre-step: 'alli' -> 'al', then re-run step2 on the result,
-    # rather than a single flat replacement -- this can cascade (e.g. so a
-    # second '-alli' revealed underneath also gets reduced).
+    # nltk-only: alli -> al, then re-check step2 (can cascade)
     if _ends_with(word, string(b"alli")):
         check_stem = _replace_suffix(word, string(b"alli"), string(b""))
         if _has_positive_measure(check_stem):
@@ -254,7 +221,7 @@ cdef string _step2(const string& word) noexcept nogil:
         if _has_positive_measure(check_stem):
             return check_stem + string(b"ize")
         return word
-    if _ends_with(word, string(b"bli")):  # NLTK_EXTENSIONS: 'bli' not 'abli'
+    if _ends_with(word, string(b"bli")):  # nltk extensions: 'bli' not 'abli'
         check_stem = _replace_suffix(word, string(b"bli"), string(b""))
         if _has_positive_measure(check_stem):
             return check_stem + string(b"ble")
@@ -329,15 +296,13 @@ cdef string _step2(const string& word) noexcept nogil:
         if _has_positive_measure(check_stem):
             return check_stem + string(b"ble")
         return word
-    if _ends_with(word, string(b"fulli")):  # NLTK-only
+    if _ends_with(word, string(b"fulli")):  # nltk-only
         check_stem = _replace_suffix(word, string(b"fulli"), string(b""))
         if _has_positive_measure(check_stem):
             return check_stem + string(b"ful")
         return word
-    if _ends_with(word, string(b"logi")):  # NLTK-only
-        # Condition checks word[:-3] (keeps the 'l' with the stem), NOT the
-        # "logi"-stripped form -- deliberate, per nltk's own comment: this is
-        # what lets short stems like 'geo'/'theo' behave like 'archaeo'/'philo'.
+    if _ends_with(word, string(b"logi")):  # nltk-only
+        # keeps the 'l' with the stem, not the "logi"-stripped form
         check_stem = word.substr(0, word.size() - 3)
         if _has_positive_measure(check_stem):
             return _replace_suffix(word, string(b"logi"), string(b"log"))
@@ -485,15 +450,12 @@ _IRREGULAR_POOL[string(b"howe")] = string(b"howe")
 _IRREGULAR_POOL[string(b"proceed")] = string(b"proceed")
 _IRREGULAR_POOL[string(b"exceed")] = string(b"exceed")
 _IRREGULAR_POOL[string(b"succeed")] = string(b"succeed")
-# Populated once here, at module import time (which always holds the GIL) --
-# not lazily from inside the nogil stemming path, which would need to
-# reacquire the GIL on every single token just to check whether it's built.
+# built once at import time, not lazily inside the nogil path
 
 
 cdef string _porter_stem(const string& word) noexcept nogil:
-    """Full pipeline, matching nltk.stem.porter.PorterStemmer().stem()
-    exactly for NLTK_EXTENSIONS mode. Caller guarantees `word` is already
-    lowercase [a-z0-9]+, so nltk's own `.lower()` step is a no-op, skipped."""
+    """full stemmer pipeline, matches nltk exactly. word must already be
+    lowercase [a-z0-9]+"""
     cdef _umap[string, string].iterator it = _IRREGULAR_POOL.find(word)
     if it != _IRREGULAR_POOL.end():
         return deref(it).second
@@ -512,38 +474,24 @@ cdef string _porter_stem(const string& word) noexcept nogil:
 
 
 def porter_stem(bytes word not None) -> bytes:
-    """Python-callable wrapper, for exhaustive validation against nltk and
-    for use from Python (submission/_analysis.py could call this too, but
-    currently only the C++ tokenizer path below does)."""
+    """python callable wrapper, used for testing against nltk"""
     cdef string s = string(<char*>word, len(word))
     return _porter_stem(s)
 
 
 cdef class Builder:
-    """Accumulates (term_id, doc_id, tf) triples across the whole corpus.
-
-    Holding the output in C++ vectors rather than Python lists is a large part
-    of the win: the previous path performed three Python-level `append` calls per
-    posting, ~48M in total.
-    """
+    """accumulates (term_id, doc_id, tf) across the corpus in c++ vectors
+    instead of python lists"""
     cdef unordered_map[string, int] vocab
-    cdef vector[string] term_bytes          # term id -> its bytes, for the dictionary
-    cdef vector[int] scratch_tf             # term id -> tf within the current document
-    cdef vector[int] touched                # term ids used by the current document
-    # Postings held per term, not one document-ordered stream: documents are
-    # processed in ascending id order, so each term's doc list is already
-    # ascending, removing the 16.3M-element np.lexsort the old layout needed
-    # (3.06s of a 5.78s build).
-    cdef vector[vector[int32_t]] post_docs
+    cdef vector[string] term_bytes          # term id -> bytes
+    cdef vector[int] scratch_tf             # term id -> tf in current doc
+    cdef vector[int] touched                # term ids touched by current doc
+    cdef vector[vector[int32_t]] post_docs  # per term postings, not one big stream
     cdef vector[vector[int32_t]] post_tfs
     cdef Py_ssize_t max_token_len
     cdef Py_ssize_t min_token_len
     cdef bint stem_tokens
-    # Mirrors _analysis.py's own _stem_cache: natural text repeats tokens
-    # heavily, so caching the stemmed FORM (not just vocab interning, which
-    # only dedups AFTER stemming) avoids re-running the full algorithm on
-    # every occurrence of a common word.
-    cdef unordered_map[string, string] stem_cache
+    cdef unordered_map[string, string] stem_cache  # cache stemmed form, text repeats a lot
 
     def __cinit__(self, Py_ssize_t min_token_len=1, Py_ssize_t max_token_len=32,
                  bint stem_tokens=False):
@@ -553,9 +501,8 @@ cdef class Builder:
 
     @staticmethod
     def supports(config) -> bool:
-        """True for the analysis chains this kernel reproduces exactly: the
-        default chain, and that same chain with Porter stemming (the only
-        stemmer this project uses -- see submission/_analysis.py)."""
+        """true for default chain +/- porter stemming, that's all this
+        kernel reproduces exactly"""
         d = config.to_dict() if hasattr(config, "to_dict") else dict(config)
         return (d.get("lowercase", True)
                 and not d.get("remove_stopwords", False)
@@ -563,11 +510,8 @@ cdef class Builder:
                 and not d.get("split_alphanum", False))
 
     def add_document(self, bytes lowered_utf8, int doc_id, Py_ssize_t prefix_tokens=-1):
-        """Tokenise one document and emit its postings. Returns the token count.
-
-        `prefix_tokens >= 0` stops after that many surviving tokens, which is how
-        the pseudo-title field is built without a second pass over the text.
-        """
+        """tokenise + emit postings for one doc, returns token count.
+        prefix_tokens>=0 stops early, used for the title field"""
         cdef const unsigned char* buf = <const unsigned char*>lowered_utf8
         cdef Py_ssize_t n = len(lowered_utf8)
         cdef Py_ssize_t i = 0, start
@@ -592,16 +536,10 @@ cdef class Builder:
             length = i - start
             if length < self.min_token_len or length > self.max_token_len:
                 continue
-            # Document length counts tokens that SURVIVE the filter -- the
-            # Python analyzer appends to its output list only after filtering,
-            # and doc_len feeds BM25's length normalisation, so an off-by-any
-            # here would silently change every score.
-            n_tokens += 1
+            n_tokens += 1  # only counts tokens that survive the length filter
 
             key = string(<const char*>(buf + start), length)
             if self.stem_tokens:
-                # Length filter above already ran on the RAW token, matching
-                # _analysis.py's order exactly: filter, then stem.
                 cache_it = self.stem_cache.find(key)
                 if cache_it == self.stem_cache.end():
                     stemmed = _porter_stem(key)
@@ -627,7 +565,6 @@ cdef class Builder:
             if prefix_tokens >= 0 and n_tokens >= prefix_tokens:
                 break
 
-        # Flush this document's postings, resetting only what was touched.
         for j in range(<Py_ssize_t>self.touched.size()):
             t = self.touched[j]
             self.post_docs[t].push_back(<int32_t>doc_id)
@@ -636,7 +573,7 @@ cdef class Builder:
         return n_tokens
 
     def terms(self):
-        """Vocabulary in first-seen order, as Python strings."""
+        """vocab in first-seen order"""
         cdef Py_ssize_t v = <Py_ssize_t>self.term_bytes.size()
         cdef Py_ssize_t i
         out = [None] * v
@@ -645,13 +582,8 @@ cdef class Builder:
         return out
 
     def finish_sorted(self, const int32_t[::1] order):
-        """Concatenate postings in sorted-term order. Returns (docs, tfs, df).
-
-        `order[i]` is the original term id of the i-th alphabetically-sorted
-        term. Walking terms in that order and copying each one's vector produces
-        exactly the layout the encoder wants -- grouped by term, ascending by
-        doc id within a term -- in a single pass, with no sort anywhere.
-        """
+        """concat postings in sorted-term order, one pass no sort needed
+        since order[i] already tells us which original term id goes where"""
         cdef Py_ssize_t n_terms = order.shape[0]
         cdef Py_ssize_t i, j, t, total = 0, pos = 0
 

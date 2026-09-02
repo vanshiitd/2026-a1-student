@@ -1,20 +1,9 @@
 """
-submission/_scorers.py — the scorer registry.
-
-Every ranking function is a pure, vectorised contribution over one query
-term's postings list, so one postings traversal serves N scorers and each is
-independently unit-testable against a hand-computed example.
+submission/_scorers.py -- scorer registry. each scorer is a vectorised
+per-term contribution fn so one traversal can feed all of them
 
     term_contribution(tfs, doc_lens, df, cf, query_tf, stats, **params) -> ndarray
-        Score contribution of ONE query term to each document in its postings
-        list. tfs/doc_lens are parallel arrays over that list.
-
     doc_prior(doc_lens, query_len, stats, **params) -> ndarray | None
-        Optional per-document term-independent term (language models need
-        this for the smoothing normaliser; BM25 returns None).
-
-Parameters are always explicit keyword args with registry defaults, never
-constants captured in the function body -- k1/b must be tunable.
 """
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
@@ -24,10 +13,9 @@ import numpy as np
 
 @dataclass(frozen=True)
 class CollectionStats:
-    """Corpus-level statistics every scorer may read."""
-    N: int                    # number of documents
-    avg_doc_len: float        # mean document length in tokens
-    total_tokens: int         # total tokens in the collection (LM/DFR need this)
+    N: int
+    avg_doc_len: float
+    total_tokens: int
 
 
 @dataclass(frozen=True)
@@ -61,7 +49,6 @@ def available() -> Dict[str, Scorer]:
 
 
 def resolve_params(name: str, overrides: Optional[Dict[str, float]] = None) -> Dict[str, float]:
-    """Merge caller overrides onto a scorer's declared defaults."""
     params = dict(get(name).defaults)
     if overrides:
         unknown = set(overrides) - set(params)
@@ -71,24 +58,10 @@ def resolve_params(name: str, overrides: Optional[Dict[str, float]] = None) -> D
     return params
 
 
-# ---------------------------------------------------------------------------
-# IDF
-# ---------------------------------------------------------------------------
-
 def robertson_idf(df: int, N: int) -> float:
-    """Robertson-Sparck Jones IDF, +1-smoothed so it stays non-negative even for
-    terms appearing in more than half the collection:
-
-        IDF = ln( (N - df + 0.5) / (df + 0.5) + 1 )
-
-    This is the form given in the assignment's bm25.py docstring.
-    """
+    """IDF = ln( (N - df + 0.5) / (df + 0.5) + 1 )"""
     return float(np.log((N - df + 0.5) / (df + 0.5) + 1.0))
 
-
-# ---------------------------------------------------------------------------
-# BM25
-# ---------------------------------------------------------------------------
 
 @register(
     "bm25",
@@ -96,11 +69,7 @@ def robertson_idf(df: int, N: int) -> float:
     description="Okapi BM25 (Robertson & Zaragoza 2009).",
 )
 def bm25_contribution(tfs, doc_lens, df, cf, query_tf, stats: CollectionStats, k1=1.2, b=0.75):
-    """
-        IDF(q) * [ tf * (k1 + 1) ] / [ tf + k1 * (1 - b + b * dl / avgdl) ]
-
-    k1 controls term-frequency saturation, b controls length normalisation.
-    """
+    """IDF(q) * [ tf*(k1+1) ] / [ tf + k1*(1 - b + b*dl/avgdl) ]"""
     tf = tfs.astype(np.float64)
     avgdl = stats.avg_doc_len or 1.0
     norm = k1 * (1.0 - b + b * (doc_lens / avgdl))
@@ -114,44 +83,19 @@ def bm25_contribution(tfs, doc_lens, df, cf, query_tf, stats: CollectionStats, k
 )
 def bm25plus_contribution(tfs, doc_lens, df, cf, query_tf, stats: CollectionStats,
                           k1=1.2, b=0.75, delta=1.0):
-    """BM25 with a constant floor added to the normalised term frequency:
-
-        IDF(q) * ( [ tf * (k1+1) ] / [ tf + k1*(1 - b + b*dl/avgdl) ] + delta )
-
-    Fixes BM25's over-penalisation of long documents -- a matching term in a
-    long document can otherwise score arbitrarily close to zero. Relevant here
-    because this collection's lengths are strongly bimodal (notes/findings.md
-    F2), which is exactly the regime the delta floor was designed for.
-    """
+    """bm25 with a delta floor added, fixes long doc over-penalisation"""
     tf = tfs.astype(np.float64)
     avgdl = stats.avg_doc_len or 1.0
     norm = k1 * (1.0 - b + b * (doc_lens / avgdl))
     return robertson_idf(df, stats.N) * ((tf * (k1 + 1.0)) / (tf + norm) + delta)
 
 
-# ---------------------------------------------------------------------------
-# Language model with Dirichlet smoothing
-# ---------------------------------------------------------------------------
-
 def _lm_dirichlet_prior(doc_lens, query_len, stats: CollectionStats, mu=1500.0):
-    """The term-independent half of the Dirichlet-smoothed query likelihood:
-
-        |Q| * log( mu / (|D| + mu) )
-
-    Applied once per candidate document. Safe for empty documents (dl = 0 gives
-    log(1) = 0) -- this collection has 8 of them (notes/findings.md F2).
-    """
+    """|Q| * log( mu / (dl + mu) ), per doc term"""
     return query_len * np.log(mu / (doc_lens + mu))
 
 
-# ---------------------------------------------------------------------------
-# Divergence From Randomness (Amati & van Rijsbergen 2002). Scores a term by
-# how far its distribution diverges from a random process, an entirely
-# different route from BM25's saturation heuristic. Both below follow
-# Terrier's reference implementations (PL2.java, DPH.java) -- transcribed
-# rather than derived, and listed as such in the report's provenance statement.
-# ---------------------------------------------------------------------------
-
+# DFR scorers below, ported from Terrier's PL2.java/DPH.java
 _LOG2_E = float(np.log2(np.e))
 _LOG2_2PI = float(np.log2(2.0 * np.pi))
 
@@ -166,27 +110,14 @@ def _log2(x):
     description="DFR PL2: Poisson model, Laplace after-effect, Normalisation 2.",
 )
 def pl2_contribution(tfs, doc_lens, df, cf, query_tf, stats: CollectionStats, c=1.0):
-    """PL2 = Poisson randomness + Laplace after-effect + Normalisation 2.
-
-        tfn    = tf * log2(1 + c * avgdl / dl)          (Normalisation 2)
-        lambda = cf / N
-        score  = qtf * 1/(tfn+1) * [ tfn*log2(tfn/lambda)
-                                     + (lambda + 1/(12*tfn) - tfn)*log2(e)
-                                     + 0.5*log2(2*pi*tfn) ]
-
-    `c` plays the role BM25's `b` does -- it sets how hard document length is
-    normalised -- but enters multiplicatively inside a logarithm rather than as
-    a linear interpolation, which is why the two models disagree about long
-    documents in a genuinely different way.
-    """
+    """tfn = tf*log2(1 + c*avgdl/dl), then poisson+laplace+norm2 formula"""
     tf = tfs.astype(np.float64)
     avgdl = stats.avg_doc_len or 1.0
     dl = np.maximum(doc_lens, 1.0)
     tfn = tf * _log2(1.0 + c * avgdl / dl)
 
     out = np.zeros(tf.shape, dtype=np.float64)
-    # tfn <= 0 carries no evidence and would make the logs undefined.
-    ok = tfn > 0.0
+    ok = tfn > 0.0  # tfn<=0 makes the logs undefined
     if not ok.any():
         return out
 
@@ -208,34 +139,21 @@ def pl2_contribution(tfs, doc_lens, df, cf, query_tf, stats: CollectionStats, c=
     description="DFR DPH: hypergeometric, parameter-free (no tuning knob at all).",
 )
 def dph_contribution(tfs, doc_lens, df, cf, query_tf, stats: CollectionStats):
-    """DPH -- parameter-free DFR.
-
-        f     = tf / dl
-        norm  = (1 - f)^2 / (tf + 1)
-        score = qtf * norm * [ tf*log2( (tf*avgdl/dl) * (N/cf) )
-                               + 0.5*log2(2*pi*tf*(1-f)) ]
-
-    Having no free parameter is the point: it cannot be overfitted to the dev
-    set, which on a 50-topic collection is a real advantage rather than a
-    limitation (see notes/findings.md F20 -- selection bias on this data is the
-    same order as the effects being chased).
-    """
+    """parameter free dfr scorer, formula from terrier"""
     tf = tfs.astype(np.float64)
     avgdl = stats.avg_doc_len or 1.0
     dl = np.maximum(doc_lens, 1.0)
     f = tf / dl
 
     out = np.zeros(tf.shape, dtype=np.float64)
-    # f >= 1 means the document is nothing but this term; (1-f) then makes the
-    # after-effect log undefined, and such a document carries no evidence anyway.
-    ok = (f < 1.0) & (tf > 0.0)
+    ok = (f < 1.0) & (tf > 0.0)  # f>=1 = doc is nothing but this term, skip
     if not ok.any():
         return out
 
     t, ff, d = tf[ok], f[ok], dl[ok]
     norm = (1.0 - ff) ** 2 / (t + 1.0)
     inv_p = (t * avgdl / d) * (stats.N / max(cf, 1))
-    inv_p = np.maximum(inv_p, 1.0 + 1e-12)   # keep log2 non-negative
+    inv_p = np.maximum(inv_p, 1.0 + 1e-12)
     out[ok] = query_tf * norm * (
         t * _log2(inv_p) + 0.5 * (_LOG2_2PI + _log2(t * (1.0 - ff)))
     )
@@ -249,23 +167,10 @@ def dph_contribution(tfs, doc_lens, df, cf, query_tf, stats: CollectionStats):
     description="Query-likelihood LM with Dirichlet smoothing (Zhai & Lafferty 2001).",
 )
 def lm_dirichlet_contribution(tfs, doc_lens, df, cf, query_tf, stats: CollectionStats, mu=1500.0):
-    """
-        qtf * log( 1 + tf / (mu * p(t|C)) ),    p(t|C) = cf / total_tokens
-
-    Paired with `_lm_dirichlet_prior` above, this is the standard rearrangement
-    of Dirichlet-smoothed query likelihood into a term-matched part plus a
-    document-length normaliser, so only documents containing a query term need
-    to be visited.
-
-    Ranks differently from BM25 on the same index, which is precisely why it
-    earns its place: plan.md Section 5.0 wants decorrelated runs to fuse, not a
-    marginally better single scorer.
-    """
+    """qtf * log(1 + tf/(mu*p(t|C))), p(t|C) = cf/total_tokens"""
     tf = tfs.astype(np.float64)
     total = stats.total_tokens or 1
     p_collection = cf / total
     if p_collection <= 0.0:
-        # Term is in the dictionary but has zero collection frequency, which
-        # should be impossible; fall back to a floor rather than dividing by 0.
         p_collection = 1.0 / total
     return query_tf * np.log1p(tf / (mu * p_collection))
